@@ -267,6 +267,101 @@
     </div>
 
     <!-- ===================== THE COMPARISON SECTION ===================== -->
+    <!-- ===================== SINGLE VS MULTI ===================== -->
+    <h2>Single-scale vs. multi-scale, side by side</h2>
+    <p>
+        Both approaches run the identical scoring function over the identical kind of search. The only
+        difference is <em>where</em> they look: the single-scale version sweeps a &plusmn;15 window
+        across the full-resolution channel, while the pyramid solves the same &plusmn;15 sweep on a
+        heavily reduced copy and then refines upward. That one structural change decides whether the
+        answer is findable at all.
+    </p>
+    <p>
+        Here are six plates run both ways, with NCC as the metric in both cases. Values pinned to the
+        edge of the search window are marked.
+    </p>
+
+    <table class="wide">
+        <thead>
+            <tr>
+                <th>Plate</th>
+                <th class="num">Single-scale G</th>
+                <th class="num">Single-scale R</th>
+                <th class="num">Pyramid G</th>
+                <th class="num">Pyramid R</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>church</td><td class="num">(4, <strong>15</strong>)</td><td class="num">(<strong>&minus;15</strong>, <strong>15</strong>)</td><td class="num">(4, 25)</td><td class="num">(&minus;4, 58)</td></tr>
+            <tr><td>harvesters</td><td class="num">(<strong>15</strong>, <strong>15</strong>)</td><td class="num">(<strong>15</strong>, <strong>15</strong>)</td><td class="num">(17, 60)</td><td class="num">(13, 124)</td></tr>
+            <tr><td>icon</td><td class="num">(<strong>15</strong>, <strong>15</strong>)</td><td class="num">(<strong>15</strong>, <strong>15</strong>)</td><td class="num">(17, 41)</td><td class="num">(23, 89)</td></tr>
+            <tr><td>melons</td><td class="num">(8, <strong>15</strong>)</td><td class="num">(<strong>15</strong>, <strong>15</strong>)</td><td class="num">(11, 82)</td><td class="num">(13, 178)</td></tr>
+            <tr><td>self_portrait</td><td class="num">(<strong>15</strong>, <strong>15</strong>)</td><td class="num">(<strong>15</strong>, <strong>15</strong>)</td><td class="num">(29, 79)</td><td class="num">(37, 176)</td></tr>
+            <tr><td>wharf</td><td class="num">(&minus;7, 15)</td><td class="num">(<strong>&minus;15</strong>, <strong>15</strong>)</td><td class="num">(&minus;7, 15)</td><td class="num">(&minus;16, 83)</td></tr>
+        </tbody>
+    </table>
+
+    <p>
+        All twelve single-scale estimates come back with a vertical offset of exactly 15, the largest
+        value the window allows. That is not a coincidence and it is not the algorithm finding a genuine
+        optimum. Every one of these plates has a true vertical displacement larger than 15, so the best
+        available score always sits on the boundary, and the search reports the edge of its own box.
+    </p>
+    <p>
+        Church shows the damage spreading further than you might expect. Its true red offset is
+        <code>(&minus;4, 58)</code>, and <code>&minus;4</code> is comfortably inside the window, yet
+        single-scale returns <code>&minus;15</code> for that axis. The unreachable vertical error drags
+        the best-scoring match into the corner and takes the horizontal estimate down with it. A
+        too-small window does not just truncate the answer, it corrupts the components it could have
+        recovered.
+    </p>
+
+    <div class="photo-row">
+        <figure>
+            <img src="./media/melons_ncc_align.jpg" alt="Melons, single-scale">
+            <figcaption>melons, single-scale: R <code>(15, 15)</code></figcaption>
+        </figure>
+        <figure>
+            <img src="./media/melons_pyramid.jpg" alt="Melons, pyramid">
+            <figcaption>melons, pyramid: R <code>(13, 178)</code></figcaption>
+        </figure>
+    </div>
+    <div class="photo-row">
+        <figure>
+            <img src="./media/self_portrait_ncc_align.jpg" alt="Self portrait, single-scale">
+            <figcaption>self_portrait, single-scale: R <code>(15, 15)</code></figcaption>
+        </figure>
+        <figure>
+            <img src="./media/self_portrait_pyramid.jpg" alt="Self portrait, pyramid">
+            <figcaption>self_portrait, pyramid: R <code>(37, 176)</code></figcaption>
+        </figure>
+    </div>
+    <div class="photo-row">
+        <figure>
+            <img src="./media/church_ncc_align.jpg" alt="Church, single-scale">
+            <figcaption>church, single-scale: R <code>(&minus;15, 15)</code></figcaption>
+        </figure>
+        <figure>
+            <img src="./media/church_pyramid.jpg" alt="Church, pyramid">
+            <figcaption>church, pyramid: R <code>(&minus;4, 58)</code></figcaption>
+        </figure>
+    </div>
+
+    <p>
+        Melons and self_portrait fail loudly: the channels are visibly torn apart and nobody would
+        mistake the result for a finished photograph. Church fails quietly, and that is the more
+        dangerous case. It still reads as a plausible image, just drowned in a blue-violet cast, which
+        is exactly the kind of failure that survives a quick glance at a contact sheet.
+    </p>
+    <p>
+        One row in that table is not a failure at all. Wharf's green channel sits at
+        <code>(&minus;7, 15)</code>, and both methods return exactly that, because for once the true
+        displacement fits inside the window. It is a useful control: the single-scale search is not
+        broken, and its metric is not lying. When the answer is inside the region it examines, it finds
+        it exactly. The pyramid's advantage is entirely about making sure the answer is inside that
+        region.
+    </p>
+
     <h2>Comparing alignment strategies: quality vs. elapsed time</h2>
     <p>
         I ran the same 14 plates through four separate scripts so the configurations could be timed
@@ -373,31 +468,12 @@
         large plates at all.
     </p>
     <p>
-        That sounds paradoxical until you look at what single-scale actually returns. Here is the
-        &plusmn;15 search on <code>melons.tif</code>, whose true offsets are G <code>(11, 82)</code>
-        and R <code>(13, 178)</code>:
+        That sounds paradoxical until you recall what the section above showed: single-scale is not
+        buying accuracy with its extra seconds. It spends 38 of them to return a displacement clamped
+        to the edge of its own search window. Both metrics do it, on every TIFF in the set. So this is
+        not a speed-versus-quality trade at all, and there is no configuration here where paying more
+        gets you a better picture.
     </p>
-<pre><code>melons.tif  SINGLE-SCALE ±15 ncc   G=(8,15)   R=(15,15)
-melons.tif  SINGLE-SCALE ±15 l2    G=(9,15)   R=(15,15)</code></pre>
-    <p>
-        Both metrics return <code>(15, 15)</code> for red, <em>pinned against the corner of the
-        search window in both axes</em>. The algorithm is not choosing that displacement because it
-        scores well; it is choosing it because it is the closest point to the true optimum that the
-        window permits. The correct answer is 163 pixels outside the region ever examined. Spending
-        38 seconds to confidently report a number that is clamped to the boundary is the worst possible
-        outcome, and it is what the naive approach does on every TIFF in the set.
-    </p>
-
-    <div class="photo-row">
-        <figure>
-            <img src="./media/melons_ncc_align.jpg" alt="Melons after single-scale NCC alignment">
-            <figcaption>C: single-scale NCC, 38.1 s, R clamped to <code>(15, 15)</code></figcaption>
-        </figure>
-        <figure>
-            <img src="./media/melons_pyramid.jpg" alt="Melons after pyramid alignment">
-            <figcaption>D: pyramid NCC, 4.1 s, R <code>(13, 178)</code></figcaption>
-        </figure>
-    </div>
 
     <h3>Why NCC costs roughly twice what L2 costs</h3>
     <p>
