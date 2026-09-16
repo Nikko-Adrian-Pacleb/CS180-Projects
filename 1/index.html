@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Project 1: Colorizing the Prokudin-Gorskii Photo Collection</title>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <p><a href="../index.html">&larr; Back to Portfolio</a></p>
+
+    <h1>Project 1: Images of the Russian Empire</h1>
+    <p><em>Colorizing the Prokudin-Gorskii photo collection</em></p>
+
+    <h2>Background</h2>
+    <p>
+        Sergei Mikhailovich Prokudin-Gorskii travelled the Russian Empire in the early 1900s
+        photographing everything he saw, three times over. For each scene he recorded three
+        exposures onto a single glass plate through a red, a green, and a blue filter, betting that
+        someone would eventually invent a way to put them back together. The Library of Congress
+        digitized those plates, and this project is that "eventually": take a scanned plate, cut it
+        into its three channels, and register them into one color photograph.
+    </p>
+    <p>
+        The only thing standing in the way is that the three exposures were taken seconds apart with a
+        camera that moved between them. Stacking the raw thirds gives a badly fringed image, so the
+        real work is finding the <code>(x, y)</code> translation that brings green and red into
+        agreement with blue.
+    </p>
+
+    <div class="photo-row">
+        <figure>
+            <img src="./media/melons_no_align.jpg" alt="Melons with the three channels stacked without alignment">
+            <figcaption>Channels stacked directly, no alignment</figcaption>
+        </figure>
+        <figure>
+            <img src="./media/melons_pyramid.jpg" alt="Melons after pyramid alignment">
+            <figcaption>After pyramid alignment</figcaption>
+        </figure>
+    </div>
+    <p>
+        That is <code>melons.tif</code>, and it is a useful image to keep in mind for the rest of this
+        page: its red channel is displaced by <strong>178 pixels</strong>, which turns out to be enough
+        to break the obvious algorithm entirely.
+    </p>
+
+    <!-- ===================== APPROACH ===================== -->
+    <h2>Approach</h2>
+
+    <h3>1. Splitting the plate</h3>
+    <p>
+        Each scan stacks the three exposures vertically in <strong>BGR</strong> order: blue on
+        top, then green, then red. I take the image height, integer-divide by three, and slice out the
+        three equal bands. The leftover one or two rows from the division are dropped, which keeps all
+        three channels exactly the same shape so they can be compared elementwise.
+    </p>
+<pre><code>def split_image(im):
+    height = im.shape[0] // 3
+    b = im[:height]
+    g = im[height: 2*height]
+    r = im[2*height: 3*height]
+    return b, g, r</code></pre>
+    <p>Blue stays fixed as the reference; green and red each get aligned to it independently.</p>
+
+    <h3>2. Scoring a candidate displacement</h3>
+    <p>
+        To decide whether one shift is better than another I need a single number measuring how well
+        two channels agree. I implemented both standard metrics.
+    </p>
+    <p>
+        <strong>L2 / Sum of Squared Differences.</strong> Subtract the two images pixel by pixel,
+        square, and sum. Identical images score zero, so <em>lower is better</em>. I skip the square
+        root since it is monotonic and does not change which displacement wins.
+    </p>
+<pre><code>def l2(im1, im2):
+    return np.sum((im1 - im2)**2)</code></pre>
+    <p>
+        <strong>Normalized Cross-Correlation.</strong> Mean-subtract each image, normalize each to unit
+        length, and take the dot product, which is the cosine of the angle between the two images
+        viewed as vectors. <em>Higher is better</em>, with 1.0 a perfect match.
+    </p>
+<pre><code>def ncc(im1, im2):
+    a = im1 - im1.mean()
+    b = im2 - im2.mean()
+    return np.sum((a / np.linalg.norm(a)) * (b / np.linalg.norm(b)))</code></pre>
+    <p>
+        The difference matters because the three channels are not brightness-matched: a red filter and
+        a blue filter looking at the same scene produce genuinely different intensities. Raw L2
+        punishes that global offset even when the alignment is perfect, while NCC's mean subtraction
+        and normalization make it invariant to a constant brightness shift and a constant contrast
+        scale.
+    </p>
+
+    <h3>3. Ignoring the borders</h3>
+    <p>
+        The scans carry thick black, white, and colored borders that are artifacts of the plate and the
+        scanner, not the photograph. They are also high-contrast, which means they dominate both
+        metrics and happily "align" borders to each other rather than image content. Before scoring I
+        throw away the outer 10% on every side and compare only the interior.
+    </p>
+<pre><code>def crop_image(im, frac=0.1):
+    h, w = im.shape
+    dh, dw = int(h * frac), int(w * frac)
+    return im[dh:h - dh, dw:w - dw]</code></pre>
+    <p>
+        This is also what makes <code>np.roll</code> safe to use for shifting. <code>np.roll</code>
+        wraps pixels around from one edge to the other, which would be garbage at the margins. But
+        the crop discards exactly that wrapped region before it reaches the metric.
+    </p>
+
+    <h3>4. Single-scale exhaustive search</h3>
+    <p>
+        The naive version: try every integer displacement in a window, score it, keep the best. For a
+        window of &plusmn;15 that is 31 &times; 31 = 961 candidates per channel.
+    </p>
+<pre><code>def align(to_shift, ref, window=15, metric='ncc'):
+    ref_c = crop_image(ref)
+    best = (0, 0)
+    best_score = np.inf if metric == 'l2' else -np.inf
+
+    for dy in range(-window, window + 1):
+        for dx in range(-window, window + 1):
+            to_shift_c = crop_image(np.roll(to_shift, (dy, dx), axis=(0, 1)))
+            score = l2(to_shift_c, ref_c) if metric == 'l2' else ncc(to_shift_c, ref_c)
+            better = score &lt; best_score if metric == 'l2' else score &gt; best_score
+            if better:
+                best_score, best = score, (dy, dx)
+    return best</code></pre>
+
+    <h3>5. Coarse-to-fine image pyramid</h3>
+    <p>
+        The key observation is that a 178-pixel displacement at full resolution is only a
+        178/2<sup>n</sup> pixel displacement after <em>n</em> halvings. So: shrink both channels until
+        the image is small enough that a modest window covers the whole plausible range, solve it
+        exhaustively there, then walk back up. At each step up the estimate doubles (because the image
+        doubled) and a tiny &plusmn;2 refinement search corrects the rounding that doubling introduces.
+    </p>
+<pre><code>def align_pyramid(to_shift, ref, levels, base_window=30, refine=2, metric='ncc'):
+    if levels == 0:
+        return align(to_shift, ref, window=base_window, metric=metric)
+
+    small_shift = rescale(to_shift, 0.5, anti_aliasing=True)
+    small_ref   = rescale(ref,      0.5, anti_aliasing=True)
+    dy, dx = align_pyramid(small_shift, small_ref, levels - 1, base_window, refine, metric)
+
+    dy, dx = dy * 2, dx * 2                       # carry the estimate up one octave
+
+    guess = np.roll(to_shift, (dy, dx), axis=(0, 1))
+    ddy, ddx = align(guess, ref, window=refine, metric=metric)   # local correction
+
+    return dy + ddy, dx + ddx</code></pre>
+    <p>
+        The recursion depth is chosen from the image itself rather than hard-coded, so the same code
+        handles a 390-pixel JPEG (which bottoms out immediately at zero levels and degrades gracefully
+        into the plain single-scale search) and a 3200-pixel TIFF (which gets 3 levels, bottoming out
+        around 400 pixels):
+    </p>
+<pre><code>def pyramid_levels(im, min_size=250):
+    levels = 0
+    h, w = im.shape
+    while min(h, w) // 2 >= min_size:
+        h, w = h // 2, w // 2
+        levels += 1
+    return levels</code></pre>
+    <p>
+        <code>anti_aliasing=True</code> on the downsample matters more than it looks. Decimating
+        without a low-pass filter aliases high-frequency detail into the coarse image, and since the
+        coarse level is where the large displacement is decided, an aliased coarse level produces a
+        confidently wrong answer that the &plusmn;2 refinements can never walk back.
+    </p>
+
+    <!-- ===================== SINGLE SCALE RESULTS ===================== -->
+    <h2>Results: single-scale alignment on the JPEGs</h2>
+    <p>
+        These are the three low-resolution <code>.jpg</code> plates run through the plain exhaustive
+        search with a &plusmn;15 window. No pyramid involved.
+    </p>
+
+    <div class="gallery">
+        <figure>
+            <img src="./media/cathedral_ncc_align.jpg" alt="Cathedral, single-scale alignment">
+            <figcaption>cathedral: G <code>(2, 5)</code>, R <code>(3, 12)</code></figcaption>
+        </figure>
+        <figure>
+            <img src="./media/monastery_ncc_align.jpg" alt="Monastery, single-scale alignment">
+            <figcaption>monastery: G <code>(2, &minus;3)</code>, R <code>(2, 3)</code></figcaption>
+        </figure>
+        <figure>
+            <img src="./media/tobolsk_ncc_align.jpg" alt="Tobolsk, single-scale alignment">
+            <figcaption>tobolsk: G <code>(3, 3)</code>, R <code>(3, 6)</code></figcaption>
+        </figure>
+    </div>
+
+    <p>
+        All three land cleanly, and their true displacements are all comfortably inside &plusmn;15,
+        exactly the regime the naive search was designed for. In fact the three configurations I tested
+        (single-scale L2, single-scale NCC, and the full pyramid) produce <strong>byte-identical output
+        files</strong> for all three JPEGs:
+    </p>
+<pre><code>$ md5 -q cathedral_l2_align.jpg cathedral_ncc_align.jpg cathedral_pyramid.jpg
+212d35e009aa7d63727866a57f213606
+212d35e009aa7d63727866a57f213606
+212d35e009aa7d63727866a57f213606</code></pre>
+    <p>
+        So on the small images the metric and the pyramid are both free, since every approach finds the
+        same optimum. Everything interesting happens on the TIFFs.
+    </p>
+
+    <!-- ===================== PYRAMID RESULTS ===================== -->
+    <h2>Results: pyramid alignment on the full collection</h2>
+    <p>
+        Every displacement below is reported as <code>(x, y)</code>, measured relative to the blue
+        channel, using NCC on raw pixel values with <code>base_window=30</code>. Positive <em>x</em>
+        shifts the channel right and positive <em>y</em> shifts it down.
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Image</th>
+                <th class="num">Green (x, y)</th>
+                <th class="num">Red (x, y)</th>
+                <th class="num">Time (s)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>cathedral <small>(.jpg)</small></td><td class="num">(2, 5)</td><td class="num">(3, 12)</td><td class="num">1.59</td></tr>
+            <tr><td>monastery <small>(.jpg)</small></td><td class="num">(2, &minus;3)</td><td class="num">(2, 3)</td><td class="num">1.42</td></tr>
+            <tr><td>tobolsk <small>(.jpg)</small></td><td class="num">(3, 3)</td><td class="num">(3, 6)</td><td class="num">1.44</td></tr>
+            <tr><td>church</td><td class="num">(4, 25)</td><td class="num">(&minus;4, 58)</td><td class="num">4.09</td></tr>
+            <tr><td>emir <small>&larr; fails</small></td><td class="num">(24, 49)</td><td class="num">(&minus;205, 141)</td><td class="num">4.01</td></tr>
+            <tr><td>harvesters</td><td class="num">(17, 60)</td><td class="num">(13, 124)</td><td class="num">3.94</td></tr>
+            <tr><td>icon</td><td class="num">(17, 41)</td><td class="num">(23, 89)</td><td class="num">4.20</td></tr>
+            <tr><td>ilemselga</td><td class="num">(7, 40)</td><td class="num">(11, 130)</td><td class="num">4.58</td></tr>
+            <tr><td>melons</td><td class="num">(11, 82)</td><td class="num">(13, 178)</td><td class="num">4.12</td></tr>
+            <tr><td>religous_painting</td><td class="num">(3, 28)</td><td class="num">(7, 68)</td><td class="num">3.87</td></tr>
+            <tr><td>self_portrait</td><td class="num">(29, 79)</td><td class="num">(37, 176)</td><td class="num">4.25</td></tr>
+            <tr><td>siren</td><td class="num">(&minus;6, 49)</td><td class="num">(&minus;25, 96)</td><td class="num">4.23</td></tr>
+            <tr><td>three_generations</td><td class="num">(14, 53)</td><td class="num">(11, 112)</td><td class="num">3.92</td></tr>
+            <tr><td>wharf</td><td class="num">(&minus;7, 15)</td><td class="num">(&minus;16, 83)</td><td class="num">4.10</td></tr>
+        </tbody>
+    </table>
+
+    <p>
+        Two things stand out. First, the red displacements are consistently about twice the green ones
+        in <em>y</em>. That is unsurprising, since red is the third exposure and green the second, so red
+        has had twice as long to drift. Second, <code>emir</code>'s red offset of
+        <code>(&minus;205, 141)</code> is wildly out of family with every other image, whose
+        <em>x</em> offsets all sit between &minus;25 and +37. That one is analyzed below.
+    </p>
+
+    <div class="gallery">
+        <figure><img src="./media/church_pyramid.jpg" alt="church, aligned"><figcaption>church</figcaption></figure>
+        <figure><img src="./media/harvesters_pyramid.jpg" alt="harvesters, aligned"><figcaption>harvesters</figcaption></figure>
+        <figure><img src="./media/icon_pyramid.jpg" alt="icon, aligned"><figcaption>icon</figcaption></figure>
+        <figure><img src="./media/ilemselga_pyramid.jpg" alt="ilemselga, aligned"><figcaption>ilemselga</figcaption></figure>
+        <figure><img src="./media/melons_pyramid.jpg" alt="melons, aligned"><figcaption>melons</figcaption></figure>
+        <figure><img src="./media/religous_painting_pyramid.jpg" alt="religous painting, aligned"><figcaption>religous_painting</figcaption></figure>
+        <figure><img src="./media/self_portrait_pyramid.jpg" alt="self portrait, aligned"><figcaption>self_portrait</figcaption></figure>
+        <figure><img src="./media/siren_pyramid.jpg" alt="siren, aligned"><figcaption>siren</figcaption></figure>
+        <figure><img src="./media/three_generations_pyramid.jpg" alt="three generations, aligned"><figcaption>three_generations</figcaption></figure>
+        <figure><img src="./media/wharf_pyramid.jpg" alt="wharf, aligned"><figcaption>wharf</figcaption></figure>
+        <figure><img src="./media/cathedral_pyramid.jpg" alt="cathedral, aligned"><figcaption>cathedral</figcaption></figure>
+        <figure><img src="./media/monastery_pyramid.jpg" alt="monastery, aligned"><figcaption>monastery</figcaption></figure>
+        <figure><img src="./media/tobolsk_pyramid.jpg" alt="tobolsk, aligned"><figcaption>tobolsk</figcaption></figure>
+        <figure><img src="./media/emir_pyramid.jpg" alt="emir, misaligned"><figcaption>emir, the one failure</figcaption></figure>
+    </div>
+
+    <!-- ===================== THE COMPARISON SECTION ===================== -->
+    <h2>Comparing alignment strategies: quality vs. elapsed time</h2>
+    <p>
+        I ran the same 14 plates through four separate scripts so the configurations could be timed
+        against each other cleanly. Every run starts its clock before <code>imread</code> and stops it
+        after the aligned JPEG is written, so file I/O and the TIFF decode are included in every number.
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Run</th>
+                <th>Search</th>
+                <th>Metric</th>
+                <th>Window</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>A</strong> <code>no_align.py</code></td><td>none, channels stacked as-is</td><td>n/a</td><td>n/a</td></tr>
+            <tr><td><strong>B</strong> <code>l2_align.py</code></td><td>single-scale, full resolution</td><td>L2</td><td>&plusmn;15</td></tr>
+            <tr><td><strong>C</strong> <code>ncc_align.py</code></td><td>single-scale, full resolution</td><td>NCC</td><td>&plusmn;15</td></tr>
+            <tr><td><strong>D</strong> <code>pyramid.py</code></td><td>coarse-to-fine, 3 levels</td><td>NCC</td><td>&plusmn;30 coarse, &plusmn;2 refine</td></tr>
+        </tbody>
+    </table>
+
+    <table class="wide">
+        <thead>
+            <tr>
+                <th>Image</th>
+                <th class="num">A: no align</th>
+                <th class="num">B: single-scale L2</th>
+                <th class="num">C: single-scale NCC</th>
+                <th class="num">D: pyramid NCC</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>cathedral <small>(.jpg)</small></td><td class="num">0.023</td><td class="num">0.229</td><td class="num">0.373</td><td class="num">1.59</td></tr>
+            <tr><td>church</td><td class="num">0.215</td><td class="num">15.21</td><td class="num">34.76</td><td class="num">4.09</td></tr>
+            <tr><td>emir</td><td class="num">0.277</td><td class="num">16.00</td><td class="num">34.96</td><td class="num">4.01</td></tr>
+            <tr><td>harvesters</td><td class="num">0.192</td><td class="num">19.93</td><td class="num">35.26</td><td class="num">3.94</td></tr>
+            <tr><td>icon</td><td class="num">0.296</td><td class="num">23.96</td><td class="num">37.46</td><td class="num">4.20</td></tr>
+            <tr><td>ilemselga</td><td class="num">0.785</td><td class="num">20.77</td><td class="num">37.94</td><td class="num">4.58</td></tr>
+            <tr><td>melons</td><td class="num">0.391</td><td class="num">21.11</td><td class="num">38.05</td><td class="num">4.12</td></tr>
+            <tr><td>monastery <small>(.jpg)</small></td><td class="num">0.006</td><td class="num">0.203</td><td class="num">0.392</td><td class="num">1.42</td></tr>
+            <tr><td>religous_painting</td><td class="num">0.246</td><td class="num">20.81</td><td class="num">36.52</td><td class="num">3.87</td></tr>
+            <tr><td>self_portrait</td><td class="num">0.243</td><td class="num">21.47</td><td class="num">38.88</td><td class="num">4.25</td></tr>
+            <tr><td>siren</td><td class="num">0.232</td><td class="num">21.35</td><td class="num">38.02</td><td class="num">4.23</td></tr>
+            <tr><td>three_generations</td><td class="num">0.192</td><td class="num">20.10</td><td class="num">36.39</td><td class="num">3.92</td></tr>
+            <tr><td>tobolsk <small>(.jpg)</small></td><td class="num">0.006</td><td class="num">0.220</td><td class="num">0.402</td><td class="num">1.44</td></tr>
+            <tr><td>wharf</td><td class="num">0.182</td><td class="num">21.40</td><td class="num">36.96</td><td class="num">4.10</td></tr>
+        </tbody>
+        <tfoot>
+            <tr>
+                <th>Mean, TIFFs only</th>
+                <th class="num">0.30</th>
+                <th class="num">20.19</th>
+                <th class="num">36.84</th>
+                <th class="num">4.12</th>
+            </tr>
+            <tr>
+                <th>TIFFs correctly aligned</th>
+                <th class="num">0 / 11</th>
+                <th class="num">0 / 11</th>
+                <th class="num">0 / 11</th>
+                <th class="num">10 / 11</th>
+            </tr>
+        </tfoot>
+    </table>
+    <p>
+        <small>
+            These four runs were measured in separate sessions, and this machine varies by roughly
+            &plusmn;20% between sessions depending on thermal state and background load.
+            Re-timing a single image three times back to back gave 16.7 s, 18.7 s, and 16.5 s. Small
+            differences between individual rows are therefore noise; only the large ratios discussed
+            below are meaningful.
+        </small>
+    </p>
+
+    <div class="photo-row">
+        <figure>
+            <img src="./media/time_no_align.png" alt="Terminal output, no alignment">
+            <figcaption>A: no align</figcaption>
+        </figure>
+        <figure>
+            <img src="./media/time_l2_single.png" alt="Terminal output, single-scale L2">
+            <figcaption>B: single-scale L2</figcaption>
+        </figure>
+    </div>
+    <div class="photo-row">
+        <figure>
+            <img src="./media/time_ncc_single.png" alt="Terminal output, single-scale NCC">
+            <figcaption>C: single-scale NCC</figcaption>
+        </figure>
+        <figure>
+            <img src="./media/time_pyramid.png" alt="Terminal output, pyramid">
+            <figcaption>D: pyramid NCC, with offsets</figcaption>
+        </figure>
+    </div>
+
+    <h3>The headline: the pyramid is faster <em>and</em> correct</h3>
+    <p>
+        The last row of that table is the one that matters. The pyramid is not a speed-for-accuracy
+        trade. It beats single-scale search on <strong>both</strong> axes, running 5&times;
+        faster than L2 and 9&times; faster than NCC while being the only configuration that aligns the
+        large plates at all.
+    </p>
+    <p>
+        That sounds paradoxical until you look at what single-scale actually returns. Here is the
+        &plusmn;15 search on <code>melons.tif</code>, whose true offsets are G <code>(11, 82)</code>
+        and R <code>(13, 178)</code>:
+    </p>
+<pre><code>melons.tif  SINGLE-SCALE ±15 ncc   G=(8,15)   R=(15,15)
+melons.tif  SINGLE-SCALE ±15 l2    G=(9,15)   R=(15,15)</code></pre>
+    <p>
+        Both metrics return <code>(15, 15)</code> for red, <em>pinned against the corner of the
+        search window in both axes</em>. The algorithm is not choosing that displacement because it
+        scores well; it is choosing it because it is the closest point to the true optimum that the
+        window permits. The correct answer is 163 pixels outside the region ever examined. Spending
+        38 seconds to confidently report a number that is clamped to the boundary is the worst possible
+        outcome, and it is what the naive approach does on every TIFF in the set.
+    </p>
+
+    <div class="photo-row">
+        <figure>
+            <img src="./media/melons_ncc_align.jpg" alt="Melons after single-scale NCC alignment">
+            <figcaption>C: single-scale NCC, 38.1 s, R clamped to <code>(15, 15)</code></figcaption>
+        </figure>
+        <figure>
+            <img src="./media/melons_pyramid.jpg" alt="Melons after pyramid alignment">
+            <figcaption>D: pyramid NCC, 4.1 s, R <code>(13, 178)</code></figcaption>
+        </figure>
+    </div>
+
+    <h3>Why NCC costs roughly twice what L2 costs</h3>
+    <p>
+        Runs B and C are identical in every respect except the scoring function. Same single-scale
+        search, same &plusmn;15 window, same 961 candidates, same images, so the gap between them
+        isolates metric cost. Averaged over the eleven TIFFs it is
+        <strong>20.19 s vs. 36.84 s, a factor of 1.8</strong>.
+    </p>
+    <p>
+        Because those two batches ran in different sessions, I also re-measured both metrics on a single
+        image back to back, timing only the two <code>align</code> calls so that file I/O drops out
+        entirely. That controlled comparison puts the factor a little higher:
+    </p>
+<pre><code>melons.tif  SINGLE-SCALE ±15 ncc   G=(8,15)   R=(15,15)   [38.8s]
+melons.tif  SINGLE-SCALE ±15 l2    G=(9,15)   R=(15,15)   [15.8s]   → 2.45x</code></pre>
+    <p>
+        Somewhere between 1.8&times; and 2.5&times;, then. I would not defend a more precise number than
+        that on a laptop, but the direction is unambiguous and the mechanism explains it.
+    </p>
+    <p>
+        The reason is the number of full-resolution temporary arrays each one materializes per
+        candidate. L2 builds two (the difference and its square) then reduces. NCC builds
+        the two mean-subtracted arrays, then computes two norms (each a full pass), then an elementwise
+        division per channel, then the product array, then the final sum. On a 3200 &times; 3700 float64
+        channel each of those temporaries is roughly 95 MB, so the metric's cost here is set almost
+        entirely by memory traffic rather than by arithmetic. Every extra intermediate array is another
+        95 MB written and read back, 961 times over.
+    </p>
+    <p>
+        Worth noting that this is a pure cost with no benefit at this window size: B and C disagree only
+        trivially (<code>G=(9,15)</code> vs <code>G=(8,15)</code> on melons) and both are wrong for the
+        same structural reason. NCC's robustness advantage is real, but it shows up in <em>which
+        optimum</em> gets found, not in whether a too-small window can reach it.
+    </p>
+
+    <h3>Where the time actually goes</h3>
+    <p>
+        Run A sets the floor: ~0.3 s per TIFF with no search at all is pure file read, float conversion,
+        and JPEG write. Subtract that from every other column to get the true search cost. The
+        pyramid's real alignment work is closer to 3.8 s than 4.1 s.
+    </p>
+    <p>
+        The pyramid's cost structure is what makes it cheap. Exhaustive search over a
+        &plusmn;<em>w</em> window costs <em>O</em>(<em>w</em><sup>2</sup><em>N</em>) for <em>N</em>
+        pixels. The pyramid pays that once at the coarsest level, where <em>N</em> has been divided by
+        4<sup>3</sup> = 64, and then only a handful of &plusmn;2 searches (25 candidates each) on the
+        way back up. Even though the top of the pyramid operates on full-resolution arrays, 25
+        candidates there is nothing next to 961.
+    </p>
+    <p>
+        <strong>The JPEGs invert the ordering</strong>, which is a nice sanity check on that reasoning.
+        cathedral/monastery/tobolsk are <em>slower</em> under the pyramid (1.4 to 1.6 s) than under
+        single-scale (0.2 to 0.4 s), the opposite of every TIFF row. That is because
+        <code>pyramid_levels</code> returns 0 for a 390-pixel image, so there is no pyramid at all.
+        It collapses to a single-scale search with <code>base_window=30</code> instead of 15,
+        i.e. 3721 candidates instead of 961. A 3.9&times; ratio of candidate counts, and a measured
+        1.59/0.373 = 4.3&times; ratio of runtimes. The overhead of the pyramid machinery is only worth
+        paying when there is actually a pyramid.
+    </p>
+
+    <!-- ===================== FAILURE ===================== -->
+    <h2>Where it fails: the Emir of Bukhara</h2>
+
+    <div class="photo-row">
+        <figure>
+            <img src="./media/emir_pyramid.jpg" alt="Emir of Bukhara with a misaligned red channel">
+            <figcaption><code>base_window=30</code>, R <code>(&minus;205, 141)</code></figcaption>
+        </figure>
+        <figure>
+            <img src="./media/emir_base_window_15.png" alt="Emir of Bukhara correctly aligned">
+            <figcaption><code>base_window=15</code>, R <code>(56, 104)</code></figcaption>
+        </figure>
+    </div>
+
+    <p>
+        The green channel aligns correctly at <code>(24, 49)</code> under both settings. Red is the
+        problem: at the default <code>base_window=30</code> it lands at <code>(&minus;205, 141)</code>,
+        and the robe tears into color ghosts.
+    </p>
+    <p>
+        The cause is the assumption underneath raw-pixel NCC. NCC is invariant to an <em>affine</em>
+        brightness change (one global scale and one global offset), and that is a good
+        enough model for most of these plates. The Emir's robe breaks it. That saturated blue fabric is
+        extremely bright in the blue exposure and nearly black in the red exposure, and it occupies a
+        large fraction of the frame. No single scale-and-offset reconciles those two, so at the correct
+        alignment the correlation is still mediocre, and a displacement that happens to line up dark
+        regions with dark regions scores higher. The metric is not failing to find its maximum; its
+        maximum is in the wrong place.
+    </p>
+    <p>
+        Note also <em>where</em> the error enters. It is decided at the coarsest pyramid level and then
+        locked in. Once the coarse level commits to a wrong offset, the &plusmn;2 refinements on
+        the way up can only nudge it by a couple of pixels. There is no mechanism to reconsider. This is
+        the structural weakness of coarse-to-fine: it is fast precisely because it trusts the coarse
+        estimate, and it fails exactly when that trust is misplaced.
+    </p>
+
+    <h3>An accidental fix, and why I am not counting it as one</h3>
+    <p>
+        Narrowing the coarsest-level search to <code>base_window=15</code> produces
+        <code>R = (56, 104)</code>, which is in-family with the rest of the collection and gives the
+        clean image on the right above. Same metric, same pyramid, same everything else; only the
+        coarse window changed.
+    </p>
+    <p>
+        But this is not really a fix, and it is worth being precise about why. The spurious optimum is
+        still there and still scores higher than the true one; the narrower window simply does not
+        reach far enough to find it. I got the right answer by denying the search access to the wrong
+        one. That works here and would fail on any image whose true displacement happens to be large,
+        which is exactly the case the wide window exists to handle. A parameter that has to be tuned
+        per-image is not a solution, and the assignment explicitly warns against over-tuning, so the
+        results table above reports the honest <code>base_window=30</code> failure.
+    </p>
+    <p>
+        The principled fix is to stop comparing brightness and start comparing structure. Edges appear
+        in the same places in all three channels regardless of how each filter maps scene color to
+        intensity, so running the identical search over gradient magnitude instead of raw pixels
+        sidesteps the whole problem without touching the search at all. I did not implement that here, but
+        it is the change I would make first.
+    </p>
+
+    <!-- ===================== OWN IMAGES ===================== -->
+    <h2>My own selections from the Prokudin-Gorskii collection</h2>
+    <p>
+        Three more plates pulled from the Library of Congress archive and run through the same
+        unmodified pipeline: same <code>base_window=30</code>, same NCC metric, no per-image
+        tuning. All three are roughly 3740 &times; 3240 per channel, the same scale as the provided
+        TIFFs, and all three took about the same four seconds.
+    </p>
+
+    <div class="gallery">
+        <figure>
+            <img src="./media/choice1_pyramid.jpg" alt="Hillside path with stone wall, orchard and mountain behind">
+            <figcaption>
+                <strong>Hillside path</strong><br>
+                G <code>(&minus;17, 28)</code> &middot; R <code>(&minus;34, 65)</code> &middot; 3.95 s
+            </figcaption>
+        </figure>
+        <figure>
+            <img src="./media/choice2_pyramid.jpg" alt="Stone mill beside a rocky river in a forested valley">
+            <figcaption>
+                <strong>Mill on the river</strong><br>
+                G <code>(2, 60)</code> &middot; R <code>(&minus;2, 143)</code> &middot; 3.77 s
+            </figcaption>
+        </figure>
+        <figure>
+            <img src="./media/choice3_pyramid.jpg" alt="Group posed around an ornate pavilion below a rock face">
+            <figcaption>
+                <strong>Pavilion group portrait</strong><br>
+                G <code>(13, 75)</code> &middot; R <code>(&minus;9, 185)</code> &middot; 3.88 s
+            </figcaption>
+        </figure>
+    </div>
+
+    <p>
+        The third one is the most demanding image I ran anywhere in this project: its red channel is
+        displaced <strong>185 pixels</strong> vertically, more than <code>melons.tif</code>'s 178 and
+        more than anything in the provided set. It is also the one most likely to expose a bad
+        alignment, since a group portrait gives you a dozen faces and a lattice of pavilion railings to
+        check against. Fringing that hides easily in foliage is obvious on a face. It comes out
+        clean.
+    </p>
+    <p>
+        Worth noting that all three have a <em>negative</em> red <em>x</em> offset, where most of the
+        provided plates are positive. Nothing deep; it just reflects which way the camera happened
+        to drift between exposures. But it is a reminder that the search genuinely has to explore
+        in both directions rather than assuming a consistent drift.
+    </p>
+    <p>
+        The first two also show the limit of what alignment alone can fix. Both have a bright cyan and
+        magenta fringe along the plate edges, because the three exposures do not cover exactly the same
+        field and no single translation makes the borders agree. Removing it would need a separate
+        cropping step that detects where the border ends rather than trimming a fixed margin.
+    </p>
+
+    <h2>Summary</h2>
+    <p>
+        A single-scale exhaustive search over a &plusmn;15 window handles the low-resolution plates
+        outright, so completely that L2, NCC, and the full pyramid all produce byte-identical
+        files for them. On the full-size scans it fails totally, returning displacements clamped to the
+        corner of its own search window while taking 20 to 37 seconds to do it.
+    </p>
+    <p>
+        Wrapping that same search in a coarse-to-fine pyramid fixes both problems at once: about four
+        seconds per image, and correct alignment for displacements as large as 185 pixels. Timing the
+        four configurations side by side showed that the pyramid is not a trade-off but a strict
+        improvement, that NCC costs roughly twice L2 for reasons of memory traffic rather than arithmetic,
+        and that the choice of metric is irrelevant when the search window cannot reach the answer.
+    </p>
+    <p>
+        Sixteen of the seventeen plates align cleanly: thirteen of the fourteen provided, plus
+        all three I chose myself. The Emir of Bukhara is the one failure, for a reason that belongs to
+        the metric rather than the search. And while narrowing the coarse window happens to produce the
+        right answer for that image, it does so by luck rather than by addressing the cause.
+    </p>
+</body>
+</html>
