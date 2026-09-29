@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Project 2: Fun with Filters and Frequencies</title>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <p><a href="../index.html">&larr; Back to Portfolio</a></p>
+
+    <h1>Project 2: Fun with Filters and Frequencies</h1>
+    <p><em>Convolutions, edges, sharpening, hybrid images, and multiresolution blending</em></p>
+
+    <div class="banner wide">
+        <figure>
+            <img src="./images/Mountain_Cropped.png" alt="Yosemite valley view, cropped">
+            <figcaption>Mountain</figcaption>
+        </figure>
+        <span class="banner-op">+</span>
+        <figure>
+            <img src="./images/Falls_Cropped.png" alt="Waterfall over rocks, cropped">
+            <figcaption>Falls</figcaption>
+        </figure>
+        <span class="banner-op">=</span>
+        <figure>
+            <img src="./images/Yosemite_Adjusted_Final_Blended.png" alt="Mountain and falls blended with an irregular mask">
+            <figcaption>Multiresolution blend with an irregular mask</figcaption>
+        </figure>
+    </div>
+
+    <p>Code: <a href="https://colab.research.google.com/drive/1dDqBPNoX6HohctWBm7fsLvGqUs2pw-lk?usp=sharing">Colab notebook with all of my work</a></p>
+
+    <h2>Overview</h2>
+    <p>
+        Most of this project comes down to one operation: sliding a small kernel over an image
+        and taking a weighted sum at each pixel. Which kernel you use changes what you get.
+        Averaging blurs, differencing neighbors finds edges, and subtracting a blurred image
+        from the original leaves just the detail. Adding that detail back sharpens the image.
+        Combining the blur of one image with the detail of another gives a hybrid image, and
+        doing it one frequency band at a time gives a smooth blend.
+    </p>
+    <p>
+        In Part 1 I write convolution from scratch and use it to find edges. In Part 2 I use the
+        Gaussian as a low-pass filter to sharpen images, make hybrid images, and blend images
+        with Gaussian and Laplacian stacks.
+    </p>
+
+    <!-- ===================================================================== -->
+    <!-- ============================== PART 1 =============================== -->
+    <!-- ===================================================================== -->
+    <h2>Part 1.1: Convolutions from Scratch</h2>
+
+    <h3>Four loops</h3>
+    <p>
+        Convolution flips the kernel horizontally and vertically, then slides it across the
+        image. At each position it multiplies the kernel with the pixels underneath and adds
+        everything up. My first version does this with four loops: two over the output pixels
+        and two over the kernel.
+    </p>
+<pre><code>def convolve_4_for(m1, m2):
+    m2k = m2[::-1, ::-1]                       # flip the kernel
+
+    out_h = m1.shape[0] - m2.shape[0] + 1
+    out_w = m1.shape[1] - m2.shape[1] + 1
+    result = np.zeros((out_h, out_w))
+
+    for m1y in range(out_h):
+        for m1x in range(out_w):
+            sum = 0
+            for m2y in range(m2.shape[0]):
+                for m2x in range(m2.shape[1]):
+                    sum += m1[m1y + m2y, m1x + m2x] * m2k[m2y, m2x]
+            result[m1y, m1x] = sum
+
+    return result</code></pre>
+
+    <h3>Two loops</h3>
+    <p>
+        The two inner loops are just a dot product between the kernel and the patch under it.
+        NumPy can do that in one line, so I replaced them with a slice, an elementwise multiply,
+        and a sum.
+    </p>
+<pre><code>def convolve_2_for(m1, m2):
+    m2k = m2[::-1, ::-1]
+
+    out_h = m1.shape[0] - m2.shape[0] + 1
+    out_w = m1.shape[1] - m2.shape[1] + 1
+    result = np.zeros((out_h, out_w))
+
+    for m1y in range(out_h):
+        for m1x in range(out_w):
+            sub_m1 = m1[m1y : m1y + m2.shape[0], m1x : m1x + m2.shape[1]]
+            result[m1y, m1x] = np.sum(sub_m1 * m2k)
+
+    return result</code></pre>
+
+    <h3>Checking against SciPy</h3>
+    <p>
+        To check my code I used a small non-square image and a 2&times;2 kernel. I picked a
+        kernel that isn't symmetric on purpose, so if I forgot to flip it (which would give
+        cross-correlation instead) the output would come out different from SciPy's.
+    </p>
+<pre><code>m1 = [[ 1,  2,  3],        m2 = [[1, 2],
+      [ 4,  5,  6],              [3, 4]]
+      [ 7,  8,  9],
+      [10, 11, 12]]
+
+convolve_4_for(m1, m2)  ==  convolve_2_for(m1, m2)  ==  convolve2d(m1, m2, mode='valid')
+    [[23, 33],
+     [53, 63],
+     [83, 93]]</code></pre>
+
+    <h3>Zero-fill padding</h3>
+    <p>
+        Without padding, the output shrinks by <code>k&nbsp;&minus;&nbsp;1</code> rows and
+        columns for a <code>k&times;k</code> kernel, since the kernel can only go where it fits
+        entirely inside the image. To keep the output the same size, I pad the image with zeros
+        first, <code>k&nbsp;&minus;&nbsp;1</code> in total per axis. For even-sized kernels that
+        number is odd, so I put the extra row and column on the top and left. SciPy's
+        <code>mode='same'</code> does the same thing, so my results match it for both odd and
+        even kernels.
+    </p>
+<pre><code>def convolve_zero_fill(m1, m2):
+    top_pad    = (m2.shape[0] - 1) - (m2.shape[0] - 1) // 2
+    bottom_pad = (m2.shape[0] - 1) // 2
+    left_pad   = (m2.shape[1] - 1) - (m2.shape[1] - 1) // 2
+    right_pad  = (m2.shape[1] - 1) // 2
+    m1_padded = np.pad(m1, ((top_pad, bottom_pad), (left_pad, right_pad)),
+                       'constant', constant_values=(0, 0))
+    return convolve_2_for(m1_padded, m2)</code></pre>
+
+    <h3>Runtime and boundary handling</h3>
+    <p>
+        All three versions do the same amount of math, about
+        <code>H&nbsp;&middot;&nbsp;W&nbsp;&middot;&nbsp;k<sup>2</sup></code> multiply-adds. The
+        difference is how much of it happens in Python. The four-loop version does every
+        multiply-add in Python, so it's the slowest. The two-loop version only loops over the
+        <code>H&nbsp;&middot;&nbsp;W</code> output pixels in Python and lets NumPy handle each
+        <code>k&times;k</code> product. <code>convolve2d</code> runs the whole thing in compiled
+        C.
+    </p>
+    <p>
+        I timed all three on my 1392 &times; 928 photo with the 9&times;9 box filter, one run each:
+    </p>
+<pre><code>def quick_benchmark(name, func, *args, **kwargs):
+    start_time = time.time()
+    result = func(*args, **kwargs)
+    elapsed_time = time.time() - start_time
+    print(f"{name} took: {elapsed_time:.6f} seconds")
+    return elapsed_time
+
+quick_benchmark("convolve_4_for", convolve_4_for, my_image, box_filter_9x9)
+quick_benchmark("convolve_2_for", convolve_2_for, my_image, box_filter_9x9)
+quick_benchmark("scipy.signal.convolve2d (mode='same')", convolve2d, my_image, box_filter_9x9, mode='same')</code></pre>
+    <table>
+        <thead>
+            <tr>
+                <th>Implementation</th>
+                <th class="num">Time (s)</th>
+                <th class="num">vs. convolve2d</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td><code>convolve_4_for</code></td><td class="num">82.71</td><td class="num">137&times; slower</td></tr>
+            <tr><td><code>convolve_2_for</code></td><td class="num">9.42</td><td class="num">16&times; slower</td></tr>
+            <tr><td><code>scipy.signal.convolve2d</code></td><td class="num">0.61</td><td class="num">1&times;</td></tr>
+        </tbody>
+    </table>
+    <p>
+        Going from four loops to two made it about 9&times; faster (82.7 s to 9.4 s). Each
+        output pixel went from 81 Python multiply-adds to one NumPy call. Most of the remaining
+        9.4 s is Python overhead from looping over about 1.3 million pixels and making a slice
+        for each one. <code>convolve2d</code> gets rid of that too and is another 16&times;
+        faster.
+    </p>
+    <p>
+        <small>
+            These are single runs timed with <code>time.time()</code> on Colab, so the exact
+            numbers aren't precise, but the ratios are big enough to trust. My two versions
+            compute the unpadded 1384 &times; 920 output while <code>convolve2d</code> computes
+            the full 1392 &times; 928 one. That's only about 1.5% more pixels, so it doesn't
+            change the comparison.
+        </small>
+    </p>
+    <p>
+        For boundaries, my code either doesn't pad (so the output shrinks) or pads with zeros
+        (so the output stays the same size, but everything outside the image counts as black).
+        <code>convolve2d</code> also has <code>boundary='wrap'</code> and
+        <code>boundary='symm'</code>, which mirrors the image at the edges. Mirroring avoids the
+        dark border problem I ran into below, so I used it later for the blending stacks.
+    </p>
+
+    <h3>Box filter on a photo of me</h3>
+    <p>
+        I loaded the photo in grayscale and downsampled it 4&times; with <code>INTER_AREA</code>
+        so the Python loops wouldn't take forever. Then I convolved it with a 9&times;9 box
+        filter where every entry is <code>1/81</code>.
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/MyPicture.jpg" alt="Original color photo of me" loading="lazy">
+            <figcaption>Original photo, 5568 &times; 3712</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/MyPhoto.png" alt="Grayscale photo of me">
+            <figcaption>Grayscale, downsampled 4&times;: 1392 &times; 928</figcaption>
+        </figure>
+    </div>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/MyPhoto_BoxFiltered_NoPadding.png" alt="Box filtered, no padding">
+            <figcaption>9&times;9 box, no padding: 1384 &times; 920</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/MyPhoto_BoxFiltered_Padded.png" alt="Box filtered, zero padded">
+            <figcaption>9&times;9 box, zero-fill padding: 1392 &times; 928</figcaption>
+        </figure>
+    </div>
+    <p>
+        You can see the boundary handling in the output sizes. The unpadded version is 8 pixels
+        smaller in each dimension (<code>9&nbsp;&minus;&nbsp;1</code>). The padded one keeps its
+        size, but the outer 4 pixels get darker because the average near the edge includes zeros
+        from the padding.
+    </p>
+
+    <h3>Finite differences on the same photo</h3>
+<pre><code>Dx = np.array([[1, 0, -1]])
+Dy = np.array([[1], [0], [-1]])</code></pre>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/MyImage_Dx_Padded.png" alt="Dx of my photo">
+            <figcaption><code>D<sub>x</sub></code>, rescaled so mid-gray is zero</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/MyImage_Dy_Padded.png" alt="Dy of my photo">
+            <figcaption><code>D<sub>y</sub></code>, rescaled so mid-gray is zero</figcaption>
+        </figure>
+    </div>
+    <p>
+        The derivatives can be negative, so I min-max normalized them to 0 to 255 for display.
+        Mid-gray means no change, and lighter or darker means the intensity goes up or down
+        along that direction. <code>D<sub>x</sub></code> picks up vertical edges and
+        <code>D<sub>y</sub></code> picks up horizontal ones. The windshield and hood of the car
+        are diagonal, so they show up in both.
+    </p>
+
+    <!-- ============================== 1.2 =============================== -->
+    <h2>Part 1.2: Finite Difference Operator</h2>
+    <p>
+        I convolved the cameraman image with <code>D<sub>x</sub></code> and
+        <code>D<sub>y</sub></code> to get the two partial derivatives, then combined them into
+        the gradient magnitude: <code>&radic;(&part;I/&part;x<sup>2</sup> +
+        &part;I/&part;y<sup>2</sup>)</code>.
+    </p>
+    <div class="gallery">
+        <figure>
+            <img src="./images/Cameraman_Original.png" alt="Cameraman original">
+            <figcaption>Original</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_Dx.png" alt="Cameraman Dx">
+            <figcaption>&part;I/&part;x</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_Dy.png" alt="Cameraman Dy">
+            <figcaption>&part;I/&part;y</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_Gradient_Magnitude.png" alt="Cameraman gradient magnitude">
+            <figcaption>Gradient magnitude</figcaption>
+        </figure>
+    </div>
+<pre><code>cameraman_dx = convolve_zero_fill(cameraman_image, Dx)
+cameraman_dy = convolve_zero_fill(cameraman_image, Dy)
+grad_mag = np.sqrt(cameraman_dx**2 + cameraman_dy**2)
+edges = grad_mag &gt; threshold</code></pre>
+
+    <h3>Picking a threshold</h3>
+    <p>
+        To turn this into an edge image, I thresholded the gradient magnitude. I tried
+        thresholds from 20 to 140 in steps of 20:
+    </p>
+    <div class="gallery">
+        <figure><img src="./images/Camera_man_at_edge_at_threshold20.png" alt="Threshold 20"><figcaption>threshold 20</figcaption></figure>
+        <figure><img src="./images/Camera_man_at_edge_at_threshold40.png" alt="Threshold 40"><figcaption>threshold 40</figcaption></figure>
+        <figure><img src="./images/Camera_man_at_edge_at_threshold60.png" alt="Threshold 60"><figcaption>threshold 60</figcaption></figure>
+        <figure><img src="./images/Camera_man_at_edge_at_threshold80.png" alt="Threshold 80"><figcaption>threshold 80</figcaption></figure>
+        <figure><img src="./images/Camera_man_at_edge_at_threshold100.png" alt="Threshold 100"><figcaption>threshold 100</figcaption></figure>
+        <figure><img src="./images/Camera_man_at_edge_at_threshold120.png" alt="Threshold 120"><figcaption>threshold 120</figcaption></figure>
+        <figure><img src="./images/Camera_man_at_edge_at_threshold140.png" alt="Threshold 140"><figcaption>threshold 140</figcaption></figure>
+    </div>
+    <p>
+        At 20 and 40, the grass in the bottom third of the image is full of white speckles.
+        That's just texture and noise, not real edges. At 80 most of the grass noise is gone,
+        and the outline of the coat, the camera, and all three tripod legs are still connected.
+        Above 100 the real edges start breaking up. The buildings in the background disappear
+        and the tripod legs turn into dashed lines.
+    </p>
+    <p>
+        <strong>I went with 80.</strong> It keeps all the edges I'd want on the man and the
+        tripod. I lose the faint buildings in the background, but in exchange most of the grass
+        noise is gone. There's still some speckle near the bottom. Raising the threshold more to
+        remove it would cost too many real edges, so I left it. Part 1.3 deals with that noise
+        in a better way.
+    </p>
+    <!-- ============================== 1.3 =============================== -->
+    <h2>Part 1.3: Derivative of Gaussian (DoG) Filter</h2>
+
+    <h3>Blur first, then differentiate</h3>
+    <p>
+        The finite difference filter is only three pixels wide, so a single noisy pixel looks
+        just like an edge to it. Blurring the image first averages that noise out. I made a
+        9&times;9 Gaussian with &sigma;&nbsp;=&nbsp;1 by taking the outer product of a 1D OpenCV
+        Gaussian with itself, then ran the same steps as Part 1.2 on the blurred image.
+    </p>
+<pre><code>g = cv.getGaussianKernel(9, 1)
+gaussian_filter = g @ g.T                      # 9x9, sums to 1
+
+blurred  = convolve_zero_fill(cameraman_image, gaussian_filter)
+gaus_dx  = convolve_zero_fill(blurred, Dx)
+gaus_dy  = convolve_zero_fill(blurred, Dy)
+gaus_mag = np.sqrt(gaus_dx**2 + gaus_dy**2)
+edges    = gaus_mag &gt; 40</code></pre>
+    <div class="gallery">
+        <figure>
+            <img src="./images/Cameraman_Gaussian_Filtered.png" alt="Cameraman Gaussian blurred">
+            <figcaption>Blurred, 9&times;9, &sigma;&nbsp;=&nbsp;1</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_Gaussian_Dx.png" alt="Blurred cameraman Dx">
+            <figcaption>&part;/&part;x of blurred</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_Gaussian_Dy.png" alt="Blurred cameraman Dy">
+            <figcaption>&part;/&part;y of blurred</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_Gaussian_Gradient_Magnitude.png" alt="Blurred cameraman gradient magnitude">
+            <figcaption>Gradient magnitude of blurred</figcaption>
+        </figure>
+    </div>
+
+    <h3>What difference do you see?</h3>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/Camera_man_at_edge_at_threshold40.png" alt="Finite difference edges at 40">
+            <figcaption>Finite difference, threshold 40</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_Gaussian_Edges_40.png" alt="Gaussian then finite difference edges at 40">
+            <figcaption>Gaussian, then finite difference, threshold 40</figcaption>
+        </figure>
+    </div>
+    <p>
+        With the same threshold, the blurred version is much cleaner. The grass speckle is
+        almost all gone. The edges are thicker and smoother, and they form continuous curves
+        instead of jagged 1-pixel lines, since the blur spreads each edge across a few pixels
+        before taking the derivative. Blurring lowers the gradient magnitude everywhere, but it
+        lowers the noise a lot more than the real edges, because noise averages out and real
+        edges don't. That's why 40 works here, while the unblurred version needed around 80.
+    </p>
+    <p>
+        There is one new problem: a thin bright frame around the border. This comes from zero
+        padding. The blur mixes black padding into the border pixels, which creates a sharp drop
+        in brightness at the edge of the image, and the derivative picks that up as an edge.
+    </p>
+
+    <h3>One convolution instead of two</h3>
+    <p>
+        Since convolution is associative,
+        <code>(I&nbsp;*&nbsp;G)&nbsp;*&nbsp;D<sub>x</sub>&nbsp;=&nbsp;I&nbsp;*&nbsp;(G&nbsp;*&nbsp;D<sub>x</sub>)</code>.
+        That means I can combine the Gaussian and the derivative into one filter ahead of time
+        and convolve the image once.
+    </p>
+<pre><code>DoGx = convolve2d(gaussian_filter, Dx)       # 9x11
+DoGy = convolve2d(gaussian_filter, Dy)       # 11x9
+
+dogx = convolve_zero_fill(cameraman_image, DoGx)
+dogy = convolve_zero_fill(cameraman_image, DoGy)
+dog_mag = np.sqrt(dogx**2 + dogy**2)
+
+s = slice(8, -8)
+np.allclose(gaus_mag[s, s], dog_mag[s, s])   # True</code></pre>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/DoGx.png" alt="Derivative of Gaussian filter in x">
+            <figcaption>DoG<sub>x</sub>, 9 &times; 11</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/DoGy.png" alt="Derivative of Gaussian filter in y">
+            <figcaption>DoG<sub>y</sub>, 11 &times; 9</figcaption>
+        </figure>
+    </div>
+    <p>
+        Each filter looks like a Gaussian split into a positive half (white) and a negative half
+        (black), with gray as zero. In DoG<sub>x</sub> the halves are side by side, so it finds
+        vertical edges. In DoG<sub>y</sub> they're stacked, so it finds horizontal edges. The
+        white half is on the left, but because convolution flips the kernel, it still computes
+        right minus left, the same sign as
+        <code>D<sub>x</sub>&nbsp;=&nbsp;[1,&nbsp;0,&nbsp;&minus;1]</code>. Each filter is also 2
+        pixels longer in the derivative direction, because the full convolution with the 3-wide
+        difference filter adds 1 pixel on each side.
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/Cameraman_Edges_Dup_40.png" alt="Two-step Gaussian then derivative edges">
+            <figcaption>Two convolutions: blur, then D<sub>x</sub>/D<sub>y</sub></figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Cameraman_DoG_Edges_40.png" alt="Single DoG convolution edges">
+            <figcaption>One convolution: DoG<sub>x</sub>/DoG<sub>y</sub></figcaption>
+        </figure>
+    </div>
+    <p>
+        The two edge maps look the same, and <code>np.allclose</code> confirms it. I had to cut
+        off 8 pixels around the border for the check to pass. Associativity only holds exactly
+        for an infinite image. With zero padding, the two-step version pads twice (once for the
+        blur, once for the derivative) while the DoG version pads once with a bigger kernel, so
+        the border pixels come out a bit different. Everywhere else they match.
+    </p>
+
+    <!-- ===================================================================== -->
+    <!-- ============================== PART 2 =============================== -->
+    <!-- ===================================================================== -->
+    <h2>Part 2.1: Image "Sharpening"</h2>
+
+    <h3>How unsharp masking works</h3>
+    <p>
+        A Gaussian is a low-pass filter, so <code>I&nbsp;*&nbsp;G</code> keeps only the low
+        frequencies. Subtracting that from the original leaves the high frequencies, which are
+        the edges and fine texture. Images look sharper when those are stronger, so unsharp
+        masking adds extra high frequencies back in:
+    </p>
+<pre><code>sharpened = I + &alpha;(I &minus; I * G)</code></pre>
+    <p>
+        Since convolution is linear, this can be done with one filter. Using the unit impulse
+        <code>&delta;</code> (1 in the center, 0 everywhere else, so
+        <code>I&nbsp;*&nbsp;&delta;&nbsp;=&nbsp;I</code>):
+    </p>
+<pre><code>I + &alpha;(I &minus; I*G) = I * ((1 + &alpha;)&delta; &minus; &alpha;G)</code></pre>
+<pre><code>unit_impulse = np.zeros_like(gaussian_filter)
+unit_impulse[4, 4] = 1
+
+def unsharpen_filter(image, alpha=5):
+    unsharp_filter = (1 + alpha) * unit_impulse - alpha * gaussian_filter
+    return convolve_zero_fill(image, unsharp_filter)</code></pre>
+    <p>
+        The filter sums to 1, so flat areas don't change. Only pixels that are different from
+        their neighborhood get boosted.
+    </p>
+
+    <h3>Evaluation: blur a sharp image, then sharpen it</h3>
+    <p>
+        To test this, I took a sharp night photo of the Campanile, blurred it with a 29&times;29
+        Gaussian (&sigma;&nbsp;=&nbsp;2), and used the blurred version as my input. Then I
+        sharpened it with the 9&times;9, &sigma;&nbsp;=&nbsp;1 Gaussian and
+        &alpha;&nbsp;=&nbsp;5, once as three separate steps and once as a single filter.
+    </p>
+    <div class="gallery">
+        <figure>
+            <img src="./images/campanile.jpeg" alt="Original sharp Campanile photo">
+            <figcaption>Original sharp photo</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Blurred_Campanile_Original.png" alt="Blurred Campanile input">
+            <figcaption>Input: sharp photo blurred with &sigma;&nbsp;=&nbsp;2</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Campanile_Gaus_Filtered.png" alt="Campanile low frequencies">
+            <figcaption>Low pass: I&nbsp;*&nbsp;G</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Campanile_Edge_High_Freq.png" alt="Campanile high frequencies">
+            <figcaption>High pass: I&nbsp;&minus;&nbsp;I&nbsp;*&nbsp;G (rescaled)</figcaption>
+        </figure>
+    </div>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/Campanile_Sharpened_Manual.png" alt="Campanile sharpened in three steps">
+            <figcaption>I&nbsp;+&nbsp;5(I&nbsp;&minus;&nbsp;I*G), three steps</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Campanile_Sharpened_Filter.png" alt="Campanile sharpened with one filter">
+            <figcaption>Single unsharp mask filter, &alpha;&nbsp;=&nbsp;5</figcaption>
+        </figure>
+    </div>
+    <p>
+        Both sharpened images are the same (<code>np.allclose</code> returns <code>True</code>),
+        so the single filter works. Compared to the blurred input, the windows and columns on
+        the tower are much clearer, the roofline of the building is sharper, and the lampposts
+        stand out again.
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/campanile.jpeg" alt="Original sharp Campanile, for comparison">
+            <figcaption>Original sharp photo</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Campanile_Sharpened_Filter.png" alt="Blurred then sharpened Campanile">
+            <figcaption>Blurred, then sharpened (&alpha;&nbsp;=&nbsp;5)</figcaption>
+        </figure>
+    </div>
+    <p>
+        Next to the original, though, it's clear that sharpening doesn't bring everything back.
+        The &sigma;&nbsp;=&nbsp;2 blur almost completely removed the finest detail, and unsharp
+        masking can only boost frequencies that are still there. What comes back is extra
+        contrast in the mid frequencies. It looks sharper, but it isn't the original detail.
+        Noise gets boosted too, which is why the sky in the Taj Mahal gets grainy at high
+        &alpha; below.
+    </p>
+
+    <h3>The Taj Mahal, and varying &alpha;</h3>
+    <div class="gallery">
+        <figure><img src="./images/Taj_Original.png" alt="Taj original"><figcaption>Original</figcaption></figure>
+        <figure><img src="./images/Taj_Blurred.png" alt="Taj blurred"><figcaption>Blurred: I&nbsp;*&nbsp;G</figcaption></figure>
+        <figure><img src="./images/Taj_High_Freq.png" alt="Taj high frequencies"><figcaption>High frequencies: I&nbsp;&minus;&nbsp;I&nbsp;*&nbsp;G (rescaled)</figcaption></figure>
+        <figure><img src="./images/Taj_Sharpened_Alpha_1.png" alt="Taj alpha 1"><figcaption>&alpha;&nbsp;=&nbsp;1</figcaption></figure>
+        <figure><img src="./images/Taj_Sharpened_Alpha_3.png" alt="Taj alpha 3"><figcaption>&alpha;&nbsp;=&nbsp;3</figcaption></figure>
+        <figure><img src="./images/Taj_Sharpened_Alpha_5.png" alt="Taj alpha 5"><figcaption>&alpha;&nbsp;=&nbsp;5</figcaption></figure>
+        <figure><img src="./images/Taj_Sharpened_Alpha_7.png" alt="Taj alpha 7"><figcaption>&alpha;&nbsp;=&nbsp;7</figcaption></figure>
+        <figure><img src="./images/Taj_Sharpened_Alpha_9.png" alt="Taj alpha 9"><figcaption>&alpha;&nbsp;=&nbsp;9</figcaption></figure>
+    </div>
+    <p>
+        The blurred image is what unsharp masking subtracts. Subtracting it from the original
+        gives the high-frequency image, which is mostly the carving on the building, the edges
+        of the minarets and dome, and the outlines of the trees. That's the part that gets
+        boosted.
+    </p>
+    <p>
+        &alpha; sets how much of the high frequencies get added back. At &alpha;&nbsp;=&nbsp;1
+        the difference is small, with the carving and minarets a bit more defined. At
+        &alpha;&nbsp;=&nbsp;3 it looks noticeably sharper without looking processed, so that's
+        what I'd pick. From 5 up, the side effects take over. Light and dark halos show up
+        around edges (easy to see around the dome), the sky and walkway get grainy, and the
+        trees turn into dark shapes with white outlines as pixels clip at 0 and 255. By
+        &alpha;&nbsp;=&nbsp;9 it looks more like a drawing than a photo.
+    </p>
+
+    <h3>In color</h3>
+    <p>
+        For the color version I ran the filter on each RGB channel separately and stacked them
+        back together.
+    </p>
+<pre><code>channels = [unsharpen_filter(taj_color[:, :, c], 3) for c in range(3)]
+sharpened = np.clip(np.dstack(channels), 0, 255).astype(np.uint8)</code></pre>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/Taj_Colored_Original.png" alt="Taj color original">
+            <figcaption>Original</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Taj_Colored_Sharpened_Alpha_3.png" alt="Taj color sharpened">
+            <figcaption>Sharpened, &alpha;&nbsp;=&nbsp;3, per channel</figcaption>
+        </figure>
+    </div>
+
+    <!-- ============================== 2.2 =============================== -->
+    <h2>Part 2.2: Hybrid Images</h2>
+    <p>
+        A hybrid image mixes the low frequencies of one image with the high frequencies of
+        another. Up close you mostly notice the high
+        frequencies. From far away you can't see them anymore, so only the low-frequency image
+        is left.
+    </p>
+<pre><code>def filter_color(img, kernel):
+    return np.dstack([convolve2d(img[:, :, c], kernel, mode="same")
+                      for c in range(img.shape[2])])
+
+def hybrid_image(image1, image2, sigma1, sigma2):
+    g1 = cv.getGaussianKernel(7 * sigma1, sigma1)
+    low_pass_filter = g1 @ g1.T
+
+    g2 = cv.getGaussianKernel(7 * sigma2, sigma2)
+    G2 = g2 @ g2.T
+    high_pass_filter = unit_impulse(G2.shape, "mid") - G2    # impulse minus Gaussian
+
+    return filter_color(image1, low_pass_filter) + filter_color(image2, high_pass_filter)</code></pre>
+    <p>
+        The low-pass filter is a regular 2D Gaussian. The high-pass filter is the impulse minus
+        a Gaussian, the same trick as in Part 2.1. I set the kernel size to
+        <code>7&sigma;</code> so the Gaussian doesn't get cut off.
+    </p>
+
+    <h3>Derek + Nutmeg</h3>
+    <p>
+        Derek is the low-frequency image (&sigma;<sub>1</sub>&nbsp;=&nbsp;3) and Nutmeg is the
+        high-frequency image (&sigma;<sub>2</sub>&nbsp;=&nbsp;7). I lined them up with the
+        provided <code>align_images</code> code by clicking on the eyes, then cropped to
+        <code>[200:1100, 100:700]</code> to get rid of most of the black border from the
+        rotation.
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/DerekPicture.jpg" alt="Derek">
+            <figcaption>Derek (low frequency)</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/nutmeg.jpg" alt="Nutmeg the cat">
+            <figcaption>Nutmeg (high frequency)</figcaption>
+        </figure>
+    </div>
+    <figure>
+        <img src="./images/Derek_Nutmeg_Hybrid_Output.png" alt="Derek and Nutmeg hybrid image">
+        <figcaption>Derek (low) + Nutmeg (high). Up close: cat whiskers and fur. From far away: Derek.</figcaption>
+    </figure>
+    <p>
+        <strong>Choosing the cutoffs.</strong> A Gaussian with standard deviation &sigma; in the
+        image is also a Gaussian in frequency, with standard deviation about
+        <code>1/(2&pi;&sigma;)</code> cycles per pixel. With &sigma;<sub>1</sub>&nbsp;=&nbsp;3,
+        Derek keeps frequencies below roughly 0.05 cycles/pixel. That's enough for the shape of
+        his face, hair, and shirt, but not skin texture. With &sigma;<sub>2</sub>&nbsp;=&nbsp;7,
+        Nutmeg loses everything below roughly 0.02 cycles/pixel (the overall shape of the head
+        and the fur color) and keeps the whiskers and fur edges. The two ranges overlap a
+        little, so at medium distance you can see both, and the switch from one to the other is
+        gradual.
+    </p>
+
+    <h3>Alive and wilted roses (full process)</h3>
+    <p>
+        This one shows a change over time: a fresh bouquet of red roses and a bouquet of wilted
+        ones. The wilted roses are the low-frequency image (&sigma;<sub>1</sub>&nbsp;=&nbsp;5)
+        and the fresh roses are the high-frequency image (&sigma;<sub>2</sub>&nbsp;=&nbsp;7).
+        The wilted photo was smaller, so I scaled it up 2&times; before aligning. I also
+        multiplied the high-pass part by 1.5 (<code>low + 1.5 &times; high</code>) to make the
+        fresh roses stronger up close, and cropped the result to the top 1250 rows. Up close you
+        see the sharp petal outlines of the fresh roses. From far away those disappear and you
+        see the drooping shape and faded color of the dead ones.
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/flowers_dead.jpg" alt="Wilted roses in a glass vase">
+            <figcaption>Wilted roses (low frequency)</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/flowers_alive.jpg" alt="Fresh red roses in a glass vase">
+            <figcaption>Fresh roses (high frequency)</figcaption>
+        </figure>
+    </div>
+    <figure>
+        <img src="./images/flowers.png" alt="Alive and wilted flower hybrid" style="max-width: 520px">
+        <figcaption>Hybrid: fresh up close, wilted from far away</figcaption>
+    </figure>
+
+    <h4>Frequency analysis</h4>
+    <p>
+        These are the log magnitude of the 2D Fourier transform
+        (<code>np.log(np.abs(np.fft.fftshift(np.fft.fft2(gray))))</code>). The center of each
+        plot is zero frequency, and frequency increases as you move out from the center.
+    </p>
+    <p><small>Before filtering: the aligned inputs</small></p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/wilted_original_fa.png" alt="Fourier transform of the original wilted roses">
+            <figcaption>Wilted roses, original</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/healthy_original_fa.png" alt="Fourier transform of the original fresh roses">
+            <figcaption>Fresh roses, original</figcaption>
+        </figure>
+    </div>
+    <p><small>After filtering, and the hybrid</small></p>
+    <div class="gallery">
+        <figure>
+            <img src="./images/wilted_fa.png" alt="Fourier transform of the low-passed wilted roses">
+            <figcaption>Wilted roses after the low pass</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/healthy_fa.png" alt="Fourier transform of the high-passed fresh roses">
+            <figcaption>Fresh roses after the high pass</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/hybrid_fa.png" alt="Fourier transform of the flower hybrid">
+            <figcaption>Hybrid</figcaption>
+        </figure>
+    </div>
+    <p>
+        Before filtering, both spectra look pretty similar: bright in the center and fading out
+        smoothly, with some energy at every frequency. The wilted roses also have a faint darker
+        border near the edges of the plot. I think this comes from scaling that photo up
+        2&times;, since upscaling can't add detail finer than the original pixels, so the
+        highest frequencies are nearly empty.
+    </p>
+    <p>
+        After filtering they look very different. The low-passed wilted roses only have a small
+        bright spot in the center, and everything else goes dark because the Gaussian removed
+        it. The high-passed fresh roses still have energy spread across the whole plot,
+        including far from the center. The hybrid has both: the bright center from the wilted
+        roses and the spread-out high frequencies from the fresh ones. That's why you see one
+        image up close and the other from far away.
+    </p>
+
+    <h3>Ice bowl and food bowl</h3>
+    <p>
+        This one morphs between two round bowls seen from above: a blue tub of ice water and a
+        bowl of food. The ice bowl is the low-frequency image
+        (&sigma;<sub>1</sub>&nbsp;=&nbsp;3) and the food bowl is the high-frequency image
+        (&sigma;<sub>2</sub>&nbsp;=&nbsp;5).
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/ice_bowl.jpg" alt="Blue tub of ice water">
+            <figcaption>Ice bowl (low frequency)</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/food_bowl.jpg" alt="Bowl of food">
+            <figcaption>Food bowl (high frequency)</figcaption>
+        </figure>
+    </div>
+    <figure>
+        <img src="./images/bowls_colored.png" alt="Ice bowl and food bowl hybrid" style="max-width: 520px">
+        <figcaption>Hybrid in color: food bowl up close, ice bowl from far away</figcaption>
+    </figure>
+
+    <!-- ============================== 2.3 =============================== -->
+    <h2>Part 2.3: Gaussian and Laplacian Stacks</h2>
+    <p>
+        A stack is like a pyramid, but without downsampling. Every level stays full size, so the
+        whole stack fits in one array of shape <code>(levels, H, W, 3)</code>, and levels can be
+        added or blended pixel by pixel without upsampling anything.
+    </p>
+    <p>
+        <strong>Gaussian stack:</strong> level 0 is the original image, and each level after
+        that is the previous level blurred again. I increase the blur each level
+        (&sigma;&nbsp;=&nbsp;2i at level <em>i</em>, kernel size 14i). Since blurring a blurred
+        image adds the variances, the total &sigma; at levels 1 through 6 is about 2, 4.5, 7.5,
+        11, 15, and 19. That's roughly how the blur grows in a pyramid that halves the size at
+        each level.
+    </p>
+    <p>
+        <strong>Laplacian stack:</strong> each level is one Gaussian level minus the next one,
+        which leaves one band of frequencies. The last level is just the last Gaussian level.
+        That way, adding up all the Laplacian levels gives back the original image exactly,
+        which the blending in Part 2.4 relies on.
+    </p>
+<pre><code>level = 7
+gaussian_levels = [image]
+for i in range(1, level):
+    g = cv.getGaussianKernel(i * 7 * 2, i * 2)
+    kernel = g @ g.T
+    gaussian_levels.append(np.dstack([
+        convolve2d(gaussian_levels[i - 1][:, :, c], kernel, mode='same', boundary='symm')
+        for c in range(3)]))
+gaussian_stack = np.stack(gaussian_levels)
+
+laplacian_levels = [gaussian_stack[i] - gaussian_stack[i + 1] for i in range(level - 1)]
+laplacian_levels.append(gaussian_stack[-1])
+laplacian_stack = np.stack(laplacian_levels)</code></pre>
+    <p>
+        Laplacian levels have negative values and are small, so for display I min-max normalized
+        each level (except the last) separately.
+    </p>
+
+    <h3>Apple</h3>
+    <p><small>Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Apple_Gaussian_Level_0.png" alt="Apple Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Apple_Gaussian_Level_1.png" alt="Apple Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Apple_Gaussian_Level_2.png" alt="Apple Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Apple_Gaussian_Level_3.png" alt="Apple Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Apple_Gaussian_Level_4.png" alt="Apple Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Apple_Gaussian_Level_5.png" alt="Apple Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Apple_Gaussian_Level_6.png" alt="Apple Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Apple_Laplacian_Level_0.png" alt="Apple Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_1.png" alt="Apple Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_2.png" alt="Apple Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_3.png" alt="Apple Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_4.png" alt="Apple Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_5.png" alt="Apple Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_6.png" alt="Apple Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+
+    <h3>Orange</h3>
+    <p><small>Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Orange_Gaussian_Level_0.png" alt="Orange Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Orange_Gaussian_Level_1.png" alt="Orange Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Orange_Gaussian_Level_2.png" alt="Orange Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Orange_Gaussian_Level_3.png" alt="Orange Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Orange_Gaussian_Level_4.png" alt="Orange Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Orange_Gaussian_Level_5.png" alt="Orange Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Orange_Gaussian_Level_6.png" alt="Orange Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Orange_Laplacian_Level_0.png" alt="Orange Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_1.png" alt="Orange Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_2.png" alt="Orange Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_3.png" alt="Orange Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_4.png" alt="Orange Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_5.png" alt="Orange Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_6.png" alt="Orange Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+
+    <p>
+        Each Laplacian level shows a different size of detail. Level 0 has the dimples on the
+        orange peel and the speckle on the apple. The middle levels have the outline of the
+        fruit and the highlight on the apple. The last level is just the overall color.
+    </p>
+    <p>
+        The bright frame around the apple and orange Laplacian levels is a mistake from my first
+        version. I used the default zero-fill boundary in <code>convolve2d</code> for these two,
+        so every blur darkens the border, and each difference of Gaussians gets a fake edge
+        there. I switched to <code>boundary='symm'</code> (mirror the image at the edges) for
+        all the other stacks, and the frame went away.
+    </p>
+
+    <h3>Recreating Figure 3.42 from Szeliski</h3>
+    <p>
+        Like Figure 3.42, each row below is one frequency band. The first two columns are the
+        apple and orange Laplacian levels, and the third is the blended band (explained in Part
+        2.4). The last row shows the two input images and the oraple you get from adding up all
+        the blended bands.
+    </p>
+    <div class="stack-grid wide" style="--cols: 3">
+        <div><strong><small>Apple Laplacian</small></strong></div>
+        <div><strong><small>Orange Laplacian</small></strong></div>
+        <div><strong><small>Blended band</small></strong></div>
+        <figure><img src="./images/Apple_Laplacian_Level_0.png" alt="Apple Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_0.png" alt="Orange Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_0.png" alt="Blended band, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_1.png" alt="Apple Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_1.png" alt="Orange Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_1.png" alt="Blended band, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_2.png" alt="Apple Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_2.png" alt="Orange Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_2.png" alt="Blended band, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_3.png" alt="Apple Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_3.png" alt="Orange Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_3.png" alt="Blended band, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_4.png" alt="Apple Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_4.png" alt="Orange Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_4.png" alt="Blended band, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_5.png" alt="Apple Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_5.png" alt="Orange Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_5.png" alt="Blended band, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Apple_Laplacian_Level_6.png" alt="Apple Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+        <figure><img src="./images/Orange_Laplacian_Level_6.png" alt="Orange Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_6.png" alt="Blended band, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <div class="stack-grid wide" style="--cols: 3">
+        <figure><img src="./images/Apple_Gaussian_Level_0.png" alt="Apple"><figcaption>apple</figcaption></figure>
+        <figure><img src="./images/Orange_Gaussian_Level_0.png" alt="Orange"><figcaption>orange</figcaption></figure>
+        <figure><img src="./images/Oraple_Final_Blended.png" alt="Oraple"><figcaption>sum of blended bands</figcaption></figure>
+    </div>
+
+    <!-- ============================== 2.4 =============================== -->
+    <h2>Part 2.4: Multiresolution Blending</h2>
+    <p>
+        If you just put half of one image next to half of the other, you get an obvious seam.
+        Blurring the seam with a single blur doesn't really fix it. A small blur still leaves a
+        sudden change in color or brightness, and a large blur makes the fine detail from both
+        images overlap and look ghosted.
+    </p>
+    <p>
+        Burt and Adelson's fix is to blend each frequency band with a different transition
+        width. I make a Gaussian stack of the mask and use mask level <em>i</em> to blend level
+        <em>i</em> of the two Laplacian stacks. Fine detail gets a sharp mask, so it switches
+        over quickly without ghosting. Low frequencies like overall color get a very soft mask,
+        so they fade slowly over a large area. Adding up the blended bands gives the final
+        image.
+    </p>
+<pre><code>mask_levels = [mask]
+for i in range(1, level):
+    g = cv.getGaussianKernel(i * 7 * 4, i * 8)
+    kernel = g @ g.T
+    mask_levels.append(convolve2d(mask_levels[i - 1], kernel, mode='same', boundary='symm'))
+mask_stack = np.stack(mask_levels)[..., None]            # broadcast over RGB
+
+blended_stack = mask_stack * laplacian_A + (1 - mask_stack) * laplacian_B
+result = np.clip(blended_stack.sum(axis=0), 0, 1)</code></pre>
+    <p>
+        I blur the mask much more than the images (&sigma;&nbsp;=&nbsp;8i per level instead of
+        2i). If the mask were only as soft as the image levels, the low-frequency levels would
+        still switch too quickly for how large their features are. I also used
+        <code>boundary='symm'</code> for the mask from the start. With zero fill, the mask would
+        fade to 0 at the edges of the image and let the second image leak in around the border.
+    </p>
+
+    <h3>The oraple</h3>
+    <p>
+        The mask is a vertical step: 1 on the left half (apple) and 0 on the right half (orange).
+    </p>
+    <figure>
+        <img src="./images/Oraple_Mask_Original.png" alt="Oraple step mask" style="max-width: 240px">
+        <figcaption>Step mask</figcaption>
+    </figure>
+    <p><small>Mask Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Oraple_Mask_Gaussian_Level_0.png" alt="Oraple mask Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Oraple_Mask_Gaussian_Level_1.png" alt="Oraple mask Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Oraple_Mask_Gaussian_Level_2.png" alt="Oraple mask Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Oraple_Mask_Gaussian_Level_3.png" alt="Oraple mask Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Oraple_Mask_Gaussian_Level_4.png" alt="Oraple mask Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Oraple_Mask_Gaussian_Level_5.png" alt="Oraple mask Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Oraple_Mask_Gaussian_Level_6.png" alt="Oraple mask Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Blended Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Oraple_Blended_Stack_Level_0.png" alt="Oraple blended band, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_1.png" alt="Oraple blended band, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_2.png" alt="Oraple blended band, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_3.png" alt="Oraple blended band, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_4.png" alt="Oraple blended band, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_5.png" alt="Oraple blended band, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Oraple_Blended_Stack_Level_6.png" alt="Oraple blended band, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <figure>
+        <img src="./images/Oraple_Final_Blended.png" alt="Oraple" style="max-width: 420px">
+        <figcaption>The oraple</figcaption>
+    </figure>
+    <p>
+        There's no visible seam. The orange peel texture stops sharply at the middle, but the
+        color goes from red to orange over a much wider area. That's the result of each band
+        getting its own mask width.
+    </p>
+
+    <h3>Yosemite: from a straight seam to an irregular one</h3>
+    <p>
+        These are two of my own photos from Yosemite: one looking down the valley toward the
+        granite walls, and one of water rushing over rocks at the top of a waterfall. I wanted
+        to keep the sky, trees, and cliffs from the first photo and put the waterfall and rocks
+        from the second one underneath.
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/Mountain_Original.png" alt="Mountain photo original">
+            <figcaption>Mountain view, 768 &times; 1024</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Falls_Original.png" alt="Falls photo original">
+            <figcaption>Falls, 1024 &times; 768</figcaption>
+        </figure>
+    </div>
+    <p>
+        One photo is portrait and the other is landscape, so I cropped both to 768 &times; 768,
+        using the bottom square of the mountain photo and the left square of the falls photo.
+    </p>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/Mountain_Cropped.png" alt="Mountain cropped">
+            <figcaption>Mountain, cropped</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Falls_Cropped.png" alt="Falls cropped">
+            <figcaption>Falls, cropped</figcaption>
+        </figure>
+    </div>
+
+    <p><small>Mountain Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Mountain_Gaussian_Level_0.png" alt="Mountain Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Mountain_Gaussian_Level_1.png" alt="Mountain Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Mountain_Gaussian_Level_2.png" alt="Mountain Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Mountain_Gaussian_Level_3.png" alt="Mountain Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Mountain_Gaussian_Level_4.png" alt="Mountain Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Mountain_Gaussian_Level_5.png" alt="Mountain Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Mountain_Gaussian_Level_6.png" alt="Mountain Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Mountain Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Mountain_Laplacian_Level_0.png" alt="Mountain Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_1.png" alt="Mountain Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_2.png" alt="Mountain Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_3.png" alt="Mountain Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_4.png" alt="Mountain Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_5.png" alt="Mountain Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_6.png" alt="Mountain Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Falls Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Falls_Gaussian_Level_0.png" alt="Falls Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Falls_Gaussian_Level_1.png" alt="Falls Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Falls_Gaussian_Level_2.png" alt="Falls Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Falls_Gaussian_Level_3.png" alt="Falls Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Falls_Gaussian_Level_4.png" alt="Falls Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Falls_Gaussian_Level_5.png" alt="Falls Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Falls_Gaussian_Level_6.png" alt="Falls Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Falls Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Falls_Laplacian_Level_0.png" alt="Falls Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_1.png" alt="Falls Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_2.png" alt="Falls Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_3.png" alt="Falls Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_4.png" alt="Falls Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_5.png" alt="Falls Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_6.png" alt="Falls Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p>
+        These stacks use <code>boundary='symm'</code>, so the bright frame from the apple and
+        orange stacks isn't there.
+    </p>
+
+    <h4>First attempt: a slanted line</h4>
+    <p>
+        The rocks in the falls photo slope down from left to right, so a horizontal seam would
+        go through rock on one side and the background on the other. My first mask was a
+        straight line from row 400 on the left to row 600 on the right, with everything below it
+        coming from the falls photo.
+    </p>
+<pre><code>yy, xx = np.mgrid[0:H, 0:W]
+line_y = 400 + (600 - 400) * xx / W
+mask[yy &gt;= line_y] = 1.0</code></pre>
+    <figure>
+        <img src="./images/Yosemite_Slanted_Mask.png" alt="Slanted mask" style="max-width: 240px">
+        <figcaption>Slanted mask</figcaption>
+    </figure>
+    <p><small>Mask Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Yosemite_Mask_Gaussian_Level_0.png" alt="Slanted mask Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Yosemite_Mask_Gaussian_Level_1.png" alt="Slanted mask Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Yosemite_Mask_Gaussian_Level_2.png" alt="Slanted mask Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Yosemite_Mask_Gaussian_Level_3.png" alt="Slanted mask Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Yosemite_Mask_Gaussian_Level_4.png" alt="Slanted mask Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Yosemite_Mask_Gaussian_Level_5.png" alt="Slanted mask Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Yosemite_Mask_Gaussian_Level_6.png" alt="Slanted mask Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Blended Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Yosemite_Blended_Stack_Level_0.png" alt="Slanted blended band, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Yosemite_Blended_Stack_Level_1.png" alt="Slanted blended band, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Yosemite_Blended_Stack_Level_2.png" alt="Slanted blended band, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Yosemite_Blended_Stack_Level_3.png" alt="Slanted blended band, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Yosemite_Blended_Stack_Level_4.png" alt="Slanted blended band, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Yosemite_Blended_Stack_Level_5.png" alt="Slanted blended band, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Yosemite_Blended_Stack_Level_6.png" alt="Slanted blended band, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+
+    <h4>Second attempt: an irregular mask that follows the rocks</h4>
+    <p>
+        The straight line is close, but the top of the rock ledge isn't straight. It goes up and
+        down with the shape of the granite. Wherever the line doesn't follow it, the blend mixes
+        rock from the falls photo with trees from the mountain photo, and that area looks hazy.
+        So I picked 17 points along the top edge of the rocks and used linear interpolation
+        between them to get a boundary height for every column:
+    </p>
+<pre><code>xs = [0,   50,  100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 580, 620, 650, 700, 768]
+ys = [390, 398, 405, 410, 415, 428, 452, 488, 510, 543, 572, 588, 597, 578, 565, 548, 530]
+
+boundary = np.interp(xx, xs, ys)
+mask[yy &gt;= boundary] = 1.0</code></pre>
+    <figure>
+        <img src="./images/Yosemite_Adjusted_Mask.png" alt="Irregular mask" style="max-width: 240px">
+        <figcaption>Irregular mask following the rock line</figcaption>
+    </figure>
+
+    <p>
+        This is my favorite result, so here's the full process like Figure 10 in Burt and
+        Adelson. Each row is one band: the mask at that level, the two Laplacian bands, and the
+        blended band.
+    </p>
+    <div class="stack-grid wide" style="--cols: 4">
+        <div><strong><small>Mask</small></strong></div>
+        <div><strong><small>Mountain band</small></strong></div>
+        <div><strong><small>Falls band</small></strong></div>
+        <div><strong><small>Blended band</small></strong></div>
+        <figure><img src="./images/Yosemite_Adjusted_Mask_Gaussian_Level_0.png" alt="Mask, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_0.png" alt="Mountain band, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_0.png" alt="Falls band, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Blended_Stack_Level_0.png" alt="Blended band, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Mask_Gaussian_Level_1.png" alt="Mask, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_1.png" alt="Mountain band, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_1.png" alt="Falls band, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Blended_Stack_Level_1.png" alt="Blended band, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Mask_Gaussian_Level_2.png" alt="Mask, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_2.png" alt="Mountain band, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_2.png" alt="Falls band, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Blended_Stack_Level_2.png" alt="Blended band, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Mask_Gaussian_Level_3.png" alt="Mask, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_3.png" alt="Mountain band, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_3.png" alt="Falls band, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Blended_Stack_Level_3.png" alt="Blended band, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Mask_Gaussian_Level_4.png" alt="Mask, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_4.png" alt="Mountain band, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_4.png" alt="Falls band, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Blended_Stack_Level_4.png" alt="Blended band, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Mask_Gaussian_Level_5.png" alt="Mask, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_5.png" alt="Mountain band, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_5.png" alt="Falls band, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Blended_Stack_Level_5.png" alt="Blended band, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Mask_Gaussian_Level_6.png" alt="Mask, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+        <figure><img src="./images/Mountain_Laplacian_Level_6.png" alt="Mountain band, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+        <figure><img src="./images/Falls_Laplacian_Level_6.png" alt="Falls band, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+        <figure><img src="./images/Yosemite_Adjusted_Blended_Stack_Level_6.png" alt="Blended band, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+
+    <div class="photo-row">
+        <figure>
+            <img src="./images/Yosemite_Final_Blended.png" alt="Yosemite blend with slanted mask">
+            <figcaption>Slanted-line mask</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Yosemite_Adjusted_Final_Blended.png" alt="Yosemite blend with irregular mask">
+            <figcaption>Irregular mask</figcaption>
+        </figure>
+    </div>
+    <p>
+        Neither blend has a visible hard edge. The irregular mask looks more natural, though,
+        because the transition happens where the scene already changes from rock to trees, so a
+        change in texture there doesn't look out of place. The difference is easiest to see at
+        full size along the ledge on the left, where the edge of the rock stays sharp instead of
+        fading into the trees behind it.
+    </p>
+
+    <h3>The Campanile, day and night</h3>
+    <p>
+        Two photos of Sather Tower from almost the same spot, one in the afternoon and one at
+        night. I used a vertical seam down the middle of the tower.
+    </p>
+    <div class="gallery">
+        <figure>
+            <img src="./images/Campanile_Day_Original.png" alt="Campanile day">
+            <figcaption>Day</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Campanile_Night_Original.png" alt="Campanile night original">
+            <figcaption>Night, original</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Campanile_Night_Resized.png" alt="Campanile night cropped and resized">
+            <figcaption>Night, top 300 rows cropped, resized to match</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/Campanile_Mask_Original.png" alt="Campanile step mask">
+            <figcaption>Mask: day on the left</figcaption>
+        </figure>
+    </div>
+    <p>
+        The tower isn't framed the same way in both photos. Cropping the top 300 rows off the
+        night photo and resizing it back to 768 &times; 1024 gets the tower to roughly the same
+        size and position, so the two halves line up at the seam.
+    </p>
+
+    <p><small>Day Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Campanile_Day_Gaussian_Level_0.png" alt="Day Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Gaussian_Level_1.png" alt="Day Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Gaussian_Level_2.png" alt="Day Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Gaussian_Level_3.png" alt="Day Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Gaussian_Level_4.png" alt="Day Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Gaussian_Level_5.png" alt="Day Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Gaussian_Level_6.png" alt="Day Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Day Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Campanile_Day_Laplacian_Level_0.png" alt="Day Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Laplacian_Level_1.png" alt="Day Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Laplacian_Level_2.png" alt="Day Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Laplacian_Level_3.png" alt="Day Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Laplacian_Level_4.png" alt="Day Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Laplacian_Level_5.png" alt="Day Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Campanile_Day_Laplacian_Level_6.png" alt="Day Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Night Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Campanile_Night_Gaussian_Level_0.png" alt="Night Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Gaussian_Level_1.png" alt="Night Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Gaussian_Level_2.png" alt="Night Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Gaussian_Level_3.png" alt="Night Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Gaussian_Level_4.png" alt="Night Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Gaussian_Level_5.png" alt="Night Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Gaussian_Level_6.png" alt="Night Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Night Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Campanile_Night_Laplacian_Level_0.png" alt="Night Laplacian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Laplacian_Level_1.png" alt="Night Laplacian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Laplacian_Level_2.png" alt="Night Laplacian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Laplacian_Level_3.png" alt="Night Laplacian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Laplacian_Level_4.png" alt="Night Laplacian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Laplacian_Level_5.png" alt="Night Laplacian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Campanile_Night_Laplacian_Level_6.png" alt="Night Laplacian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Mask Gaussian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Campanile_Mask_Gaussian_Level_0.png" alt="Campanile mask Gaussian, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Campanile_Mask_Gaussian_Level_1.png" alt="Campanile mask Gaussian, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Campanile_Mask_Gaussian_Level_2.png" alt="Campanile mask Gaussian, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Campanile_Mask_Gaussian_Level_3.png" alt="Campanile mask Gaussian, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Campanile_Mask_Gaussian_Level_4.png" alt="Campanile mask Gaussian, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Campanile_Mask_Gaussian_Level_5.png" alt="Campanile mask Gaussian, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Campanile_Mask_Gaussian_Level_6.png" alt="Campanile mask Gaussian, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+    <p><small>Blended Laplacian stack</small></p>
+    <div class="stack-grid wide" style="--cols: 7">
+        <figure><img src="./images/Campanile_Blended_Stack_Level_0.png" alt="Campanile blended band, level 0" loading="lazy"><figcaption>level 0</figcaption></figure>
+        <figure><img src="./images/Campanile_Blended_Stack_Level_1.png" alt="Campanile blended band, level 1" loading="lazy"><figcaption>level 1</figcaption></figure>
+        <figure><img src="./images/Campanile_Blended_Stack_Level_2.png" alt="Campanile blended band, level 2" loading="lazy"><figcaption>level 2</figcaption></figure>
+        <figure><img src="./images/Campanile_Blended_Stack_Level_3.png" alt="Campanile blended band, level 3" loading="lazy"><figcaption>level 3</figcaption></figure>
+        <figure><img src="./images/Campanile_Blended_Stack_Level_4.png" alt="Campanile blended band, level 4" loading="lazy"><figcaption>level 4</figcaption></figure>
+        <figure><img src="./images/Campanile_Blended_Stack_Level_5.png" alt="Campanile blended band, level 5" loading="lazy"><figcaption>level 5</figcaption></figure>
+        <figure><img src="./images/Campanile_Blended_Stack_Level_6.png" alt="Campanile blended band, level 6" loading="lazy"><figcaption>level 6</figcaption></figure>
+    </div>
+
+    <figure>
+        <img src="./images/Campanile_Final_Blended.png" alt="Campanile day and night blend" style="max-width: 420px">
+        <figcaption>Half day, half night</figcaption>
+    </figure>
+    <p>
+        The sky goes from daytime blue to night blue gradually across the middle without a line.
+        That comes from the low-frequency levels, where the mask transition is hundreds of
+        pixels wide. The tower itself is split more sharply, with the left side in daylight and
+        the right side lit up at night. That happens in the fine levels, where the mask is still
+        almost a hard step. The weak spots are where the photos don't match. The trees and
+        people on the path are from different times, and the crop and resize is only a rough
+        alignment, so any mismatch in the tower's outline shows up right at the seam.
+    </p>
+
+    <!-- ============================== WRAP UP =============================== -->
+    <h2>What I learned</h2>
+    <p>
+        The biggest thing I learned is how much the image boundary matters. Zero padding caused
+        problems all over this project. It darkened the border of the box-filtered photo, added
+        a fake edge frame to the blurred cameraman, made the DoG check only work away from the
+        border, and put bright frames on every level of my first Laplacian stacks. Convolution
+        in theory assumes the image goes on forever, but in code you have to decide what happens
+        past the edge. Switching to mirrored boundaries fixed most of these.
+    </p>
+    <p>
+        I was also surprised how much you can do with just a Gaussian. It blurs, it cleans up
+        noise before taking derivatives, subtracting it from an impulse gives a high-pass
+        filter, adding that back sharpens, and repeating it gives the frequency bands for
+        blending. Pretty much everything in this project is a small variation on the same
+        operation.
+    </p>
+
+    <h2>Image sources</h2>
+    <ul>
+        <li>Cameraman, Taj Mahal, Derek, Nutmeg, apple, and orange: provided with the assignment.</li>
+        <li>Photo of me, Campanile (day and night), and both Yosemite photos: my own.</li>
+        <li><a href="https://www.elizabethdhokia.com/healing-bowls/">Food bowl</a></li>
+        <li><a href="https://www.yogajournal.com/lifestyle/face-in-ice-water/">Ice bowl</a></li>
+        <li><a href="https://www.pinterest.com/pin/pink-flowers-in-a-glass-vase--1688918605011137/">Wilted roses in a glass vase</a></li>
+        <li><a href="https://bevessfloral.net/santa-rosa-bevess-floral-events/12-red-roses-with-glass-vase.html">Fresh red roses in a glass vase</a></li>
+    </ul>
+</body>
+</html>
