@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Project 4: Image Warping and Mosaicing</title>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <p><a href="../index.html">&larr; Back to Portfolio</a></p>
+
+    <h1>Project 4: Image Warping and Mosaicing</h1>
+    <p>
+        <a href="#part-a"><em>Part A: Image Warping and Mosaicing</em></a>
+    </p>
+
+    <figure class="wide">
+        <img src="./images/inside_blend_twoband.png" alt="Three-photo panorama of the inside set">
+        <figcaption>Three inside photos stitched into one panorama</figcaption>
+    </figure>
+
+    <p>Code: <a href="https://www.kaggle.com/code/nikkoadrianpaclebucb/project-4-part-a">Kaggle notebook with all of my work</a></p>
+
+    <h1 id="part-a">Part A: Image Warping and Mosaicing</h1>
+
+    <h2>Overview</h2>
+    <p>
+        If you stand in one spot and rotate the camera, any two photos you take are related by a
+        <em>homography</em>: a 3&times;3 matrix that maps points in one photo to points in the
+        other. Once I know that matrix, I can warp one photo into the other's view and lay them on
+        top of each other to make a wider picture. In this part I recover homographies from
+        clicked point pairs, write my own inverse warping with two interpolation methods, check
+        it by rectifying flat artwork, and then stitch photos into mosaics.
+    </p>
+    <p>
+        I wasn't allowed to use library homography or warping functions
+        (<code>cv2.findHomography</code>, <code>cv2.warpPerspective</code>,
+        <code>cv2.getPerspectiveTransform</code>, <code>skimage.transform.warp</code>, etc.), so
+        everything below is written with NumPy. OpenCV is only used to load and resize images.
+    </p>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ A.1 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>A.1 Shooting the Pictures</h2>
+    <p>
+        For each mosaic I stood in one place and only rotated my phone between shots, so all the
+        photos share a center of projection. I aimed for a lot of overlap between neighboring
+        shots so there would be plenty of features to match. I shot three sets: two photos outside,
+        three photos inside, and three photos of a kitchen.
+    </p>
+
+    <h3>Outside</h3>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/outside_left.png" alt="Left photo: glass building and crosswalk">
+            <figcaption>Left</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/outside_right.png" alt="Right photo: same building rotated right, sun in frame">
+            <figcaption>Right</figcaption>
+        </figure>
+    </div>
+
+    <h3>Inside</h3>
+    <div class="photo-row wide">
+        <figure>
+            <img src="./images/inside_left.png" alt="Left inside photo">
+            <figcaption>Left</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/inside_mid.png" alt="Middle inside photo">
+            <figcaption>Middle</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/inside_right.png" alt="Right photo: seating area with people">
+            <figcaption>Right</figcaption>
+        </figure>
+    </div>
+
+    <h3>Kitchen</h3>
+    <div class="photo-row wide">
+        <figure>
+            <img src="./images/kitchen_left.png" alt="Left kitchen photo: hallway wall and doorway">
+            <figcaption>Left</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/kitchen_mid.png" alt="Middle kitchen photo: counter with pots and a vase of flowers">
+            <figcaption>Middle</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/kitchen_right.png" alt="Right kitchen photo: counter, window blinds and groceries">
+            <figcaption>Right</figcaption>
+        </figure>
+    </div>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ A.2 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>A.2 Recovering Homographies</h2>
+    <p>
+        A homography maps a point <code>(x, y)</code> to <code>(x', y')</code> like this:
+    </p>
+<pre><code>[w x']   [a b c] [x]
+[w y'] = [d e f] [y]
+[ w  ]   [g h 1] [1]</code></pre>
+    <p>
+        The bottom-right entry is fixed to 1, which leaves 8 unknowns. Dividing out
+        <code>w = gx + hy + 1</code> and rearranging gives two equations that are linear in the
+        unknowns, one for <code>x'</code> and one for <code>y'</code>:
+    </p>
+<pre><code>a x + b y + c                 - g x x' - h y x' = x'
+                d x + e y + f - g x y' - h y y' = y'</code></pre>
+    <p>
+        Each point pair adds two rows to a system <code>A h = b</code>. Four pairs give exactly 8
+        equations, but a click that's off by a couple of pixels can throw the answer off a lot.
+        So I click more points than that (10 for each mosaic pair) and solve the overdetermined
+        system with least squares.
+    </p>
+<pre><code>def computeH(im1_pts, im2_pts):
+    im1_pts = np.asarray(im1_pts, dtype=float)
+    im2_pts = np.asarray(im2_pts, dtype=float)
+    n = im1_pts.shape[0]
+    A = np.zeros((2 * n, 8))
+    b = np.zeros(2 * n)
+    for i in range(n):
+        x, y = im1_pts[i]
+        xp, yp = im2_pts[i]
+        A[2 * i]     = [x, y, 1, 0, 0, 0, -x * xp, -y * xp]
+        A[2 * i + 1] = [0, 0, 0, x, y, 1, -x * yp, -y * yp]
+        b[2 * i]     = xp
+        b[2 * i + 1] = yp
+    h, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return np.append(h, 1.0).reshape(3, 3)</code></pre>
+
+    <h3>Correspondences</h3>
+    <p>
+        I picked points by reading pixel coordinates off the images, using sharp corners that are
+        easy to find again in the other photo: window corners and roof edges on the building,
+        and railing posts and balcony edges in the inside set. The numbers show which point matches
+        which.
+    </p>
+    <figure class="wide">
+        <img src="./images/outside_correspondences.png" alt="Outside photos with 10 numbered matching points on the building">
+        <figcaption>Outside pair: 10 correspondences on the building's corners and window edges</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/inside_correspondences_left.png" alt="Inside left and middle photos with 10 numbered matching points">
+        <figcaption>Inside left &harr; middle</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/inside_correspondences_right.png" alt="Inside middle and right photos with 10 numbered matching points">
+        <figcaption>Inside middle &harr; right</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/kitchen_correspondences_left.png" alt="Kitchen left and middle photos with 10 numbered matching points">
+        <figcaption>Kitchen left &harr; middle</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/kitchen_correspondences_right.png" alt="Kitchen middle and right photos with 10 numbered matching points">
+        <figcaption>Kitchen middle &harr; right</figcaption>
+    </figure>
+
+    <h3>Example system and recovered matrices</h3>
+    <p>
+        Here is the full system for the first rectification below (Art 1), which uses the four
+        corners of the mosaic as <code>im1_pts</code> and a 1000&times;400 rectangle as
+        <code>im2_pts</code>. With exactly four points the system is square and least squares
+        solves it exactly.
+    </p>
+<pre><code>A =
+[  621  1116  1     0     0  0   -385641   -693036]
+[    0     0  0   621  1116  1   -693036  -1245456]
+[ 1708  1209  1     0     0  0  -2768668  -1959789]
+[    0     0  0  1708  1209  1  -1906128  -1349244]
+[ 1733  1622  1     0     0  0  -2809193  -2629262]
+[    0     0  0  1733  1622  1  -2627228  -2458952]
+[  638  1752  1     0     0  0   -396198  -1087992]
+[    0     0  0   638  1752  1   -967208  -2656032]
+
+b = [621, 1116, 1621, 1116, 1621, 1516, 621, 1516]</code></pre>
+    <p>The recovered homographies:</p>
+<pre><code>Art 1 (rectification)            Art 2 (rectification)
+[ 0.3461  0.0075  313.6795]      [ 2.0622  0.0040 -369.9779]
+[-0.3598  0.5945  525.0995]      [ 0.7180  1.1255 -247.5276]
+[-0.0003  0.0000    1.0000]      [ 0.0006 -0.0000    1.0000]
+
+Inside left &rarr; middle               Inside right &rarr; middle
+[17.0849 -1.2874 -2392.2806]     [ 0.1819  0.0426  121.4705]
+[ 6.9331 10.9969 -1770.0776]     [-0.3530  0.6596   55.5697]
+[ 0.0419 -0.0008     1.0000]     [-0.0021 -0.0001    1.0000]
+
+Kitchen left &rarr; middle              Kitchen right &rarr; middle
+[ 5.2969 -0.5058 -599.5849]      [ 0.0210  0.1075  137.8513]
+[ 1.9874  3.7711 -559.6039]      [-0.4589  0.6130   64.8403]
+[ 0.0105  0.0008    1.0000]      [-0.0025 -0.0001    1.0000]
+
+Outside left &rarr; right
+[-2.9699  0.3720  971.6576]
+[-1.7382 -1.7635  796.7154]
+[-0.0063  0.0004    1.0000]</code></pre>
+    <p>
+        As a check, I mapped each clicked point through its homography and measured how far it
+        landed from its match. For all five mosaic pairs, at the resolution I stitched at, every
+        point landed within 0.3 pixels, so 10 points was enough to pin the matrices down.
+    </p>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ A.3 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>A.3 Warping the Images</h2>
+    <p>
+        I used inverse warping. If I pushed each source pixel forward through <code>H</code>,
+        some output pixels would get nothing and leave holes. Instead I go the other way: for
+        every output pixel, map it back through <code>H<sup>-1</sup></code> to find where it came
+        from in the source, then read a color there. Both of my warp functions follow these steps:
+    </p>
+    <ol>
+        <li>
+            <strong>Size the output.</strong> Push the four source corners through
+            <code>H</code>, and the min/max of the results gives the bounding box of the warped
+            image.
+        </li>
+        <li>
+            <strong>Map back.</strong> Make a grid of every output pixel, multiply by
+            <code>H<sup>-1</sup></code>, and divide by <code>w</code> to get source coordinates.
+            This is all one matrix multiply, with no Python loop over pixels.
+        </li>
+        <li>
+            <strong>Sample.</strong> Read the source color at those (non-integer) coordinates
+            using nearest-neighbor or bilinear interpolation.
+        </li>
+        <li>
+            <strong>Mask.</strong> Any output pixel whose source location falls outside the
+            source image gets alpha 0. The function returns RGBA so later steps know which
+            pixels are real.
+        </li>
+    </ol>
+    <p>
+        I treat <code>(0, 0)</code> as the <em>center</em> of the top-left pixel, so integer
+        coordinates land exactly on pixel centers and the image spans
+        <code>0 &hellip; width&minus;1</code>.
+    </p>
+
+    <h3>Nearest neighbor vs. bilinear</h3>
+    <p>
+        <strong>Nearest neighbor</strong> rounds the source coordinate to the closest pixel and
+        copies it. <strong>Bilinear</strong> takes the four pixels around the source coordinate
+        and blends them, weighting each by how close it is:
+    </p>
+<pre><code># nearest neighbor
+rx = np.round(src_x).astype(int)
+ry = np.round(src_y).astype(int)
+out[valid] = image[ry[valid], rx[valid]]
+
+# bilinear
+x0, y0 = np.floor(sx).astype(int), np.floor(sy).astype(int)
+x1, y1 = np.minimum(x0 + 1, width - 1), np.minimum(y0 + 1, height - 1)
+dx, dy = (sx - x0)[:, None], (sy - y0)[:, None]
+top    = image[y0, x0] * (1 - dx) + image[y0, x1] * dx
+bottom = image[y1, x0] * (1 - dx) + image[y1, x1] * dx
+out[valid] = top * (1 - dy) + bottom * dy</code></pre>
+
+    <h3>Rectification</h3>
+    <p>
+        Before stitching anything, I tested the warp on single photos. Each one shows a flat
+        rectangular mosaic hanging on a museum wall at an angle. I clicked its four corners and
+        mapped them to a rectangle with the right shape: 1000&times;400 for the long first one and
+        1000&times;1000 for the roughly square second one. If <code>computeH</code> and the warp
+        are right, the artwork should come out looking like it was shot straight on.
+    </p>
+
+    <h4>Art 1</h4>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/art1_corners.png" alt="Long mosaic photographed at an angle, four corners marked">
+            <figcaption>Original with the four clicked corners</figcaption>
+        </figure>
+    </div>
+    <figure class="wide">
+        <img src="./images/art1_uncropped.png" alt="Full warped output for Art 1, nearest neighbor and bilinear">
+        <figcaption>Full warp output. The black areas are outside the original photo (alpha 0).</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/art1_rectified.png" alt="Rectified Art 1 cropped, nearest neighbor and bilinear">
+        <figcaption>
+            Cropped to the region the original photo fully covers. The mosaic is now a clean
+            rectangle, and the ceiling beams that were slanted are now horizontal.
+        </figcaption>
+    </figure>
+    <figure>
+        <img src="./images/art1_zoom.png" alt="Zoomed crop of the rabbit, nearest neighbor and bilinear">
+        <figcaption>Zoomed in on the rabbit in the center panel</figcaption>
+    </figure>
+
+    <h4>Art 2</h4>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/art2_corners.png" alt="Large square mosaic of figures photographed at an angle, corners marked">
+            <figcaption>Original with the four clicked corners</figcaption>
+        </figure>
+    </div>
+    <figure class="wide">
+        <img src="./images/art2_uncropped.png" alt="Full warped output for Art 2">
+        <figcaption>Full warp output</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/art2_rectified.png" alt="Rectified Art 2 cropped, nearest neighbor and bilinear">
+        <figcaption>
+            Rectified and cropped. The left side of the mosaic was much farther from the camera,
+            so that side gets stretched the most. The doorframe on the left is now vertical too.
+        </figcaption>
+    </figure>
+    <figure>
+        <img src="./images/art2_zoom.png" alt="Zoomed crop of a bearded face, nearest neighbor and bilinear">
+        <figcaption>Zoomed in on the bearded figure's face in the upper right</figcaption>
+    </figure>
+
+    <h3>Comparing the two methods</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Image</th>
+                <th class="num">Output size</th>
+                <th class="num">Nearest neighbor</th>
+                <th class="num">Bilinear</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Art 1</td>
+                <td class="num">1833 &times; 2853</td>
+                <td class="num">0.84 s</td>
+                <td class="num">1.86 s</td>
+            </tr>
+            <tr>
+                <td>Art 2</td>
+                <td class="num">2025 &times; 2908</td>
+                <td class="num">0.88 s</td>
+                <td class="num">2.21 s</td>
+            </tr>
+        </tbody>
+    </table>
+    <p>
+        At full size the two look almost the same. The difference shows up when zoomed in.
+        Nearest neighbor gives jagged, stair-stepped edges, which are easiest to see on the
+        rabbit's outline and the dark border of the oval. Where the warp stretches the image, it
+        copies the same source pixel into several output pixels in a row, so you get blocky
+        streaks. Bilinear blends neighbors, so edges are smooth and there's no blockiness, at the
+        cost of looking slightly softer.
+    </p>
+    <p>
+        Bilinear was about 2&ndash;2.5&times; slower, because each output pixel reads four source
+        pixels and does a few multiplies instead of one lookup. For these images that's only a
+        second or two, so I used bilinear for all of the mosaics. Nearest neighbor would make
+        sense for quick previews, or for data like label masks that shouldn't be blended.
+    </p>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ A.4 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>A.4 Blending into a Mosaic</h2>
+    <p>The procedure for each mosaic:</p>
+    <ol>
+        <li>
+            <strong>Downscale.</strong> The full-size photos make huge canvases once warped, so I
+            resized them first (to 25% for the outside set and 15% for the inside and kitchen
+            sets) and scaled the clicked points by the same factor.
+        </li>
+        <li>
+            <strong>Compute homographies</strong> into a reference view with
+            <code>computeH</code>.
+        </li>
+        <li>
+            <strong>Attach a weight channel.</strong> Before warping, I stack an extra channel onto
+            each image that is 1 at its center and falls off linearly to near 0 at its edges.
+        </li>
+        <li>
+            <strong>Warp</strong> each image with <code>warpImageBilinear</code>. The weight channel
+            gets warped along with the colors, and the warp also returns its usual 0/1 alpha mask.
+        </li>
+        <li>
+            <strong>Place on a shared canvas.</strong> I push each image's corners through its
+            homography to find where its warp starts, then take the min/max over all images to
+            size the canvas.
+        </li>
+        <li>
+            <strong>Blend</strong> the layers together (three ways, compared below).
+        </li>
+        <li>
+            <strong>Crop</strong> to the largest rectangle every column of which is fully covered,
+            to drop the black wedges.
+        </li>
+    </ol>
+
+    <h3>Blending</h3>
+    <p>
+        I tried three ways of combining the overlapping images and compared them on every mosaic.
+    </p>
+    <p>
+        <strong>Average.</strong> Add up the colors and divide by how many images cover each
+        pixel. Each image counts equally right up to its border, so wherever one image ends, the
+        color jumps. Any exposure difference between photos shows up as a hard seam.
+    </p>
+    <p>
+        <strong>Feathered.</strong> Weight each image by how far a pixel is from that image's
+        nearest edge, so an image fades out as you get close to its border. This weight is the
+        extra channel from step 3:
+    </p>
+<pre><code>def edge_weight(image):
+    h, w = image.shape[:2]
+    xs, ys = np.meshgrid(np.arange(w), np.arange(h))
+    dist = np.minimum(np.minimum(xs, w - 1 - xs), np.minimum(ys, h - 1 - ys))
+    return (dist + 1) / (dist.max() + 1)
+
+def feather_blend(layers):
+    total = sum(rgb * weight[..., None] for rgb, weight, alpha in layers)
+    weight_sum = sum(weight for rgb, weight, alpha in layers)
+    return total / np.maximum(weight_sum, 1e-8)[..., None], weight_sum > 0</code></pre>
+    <p>
+        This gets rid of the seams, because the switch from one image to the next is spread across
+        the whole overlap. The downside is that it averages everything, including fine detail. If
+        the two images are off by a few pixels, you see both copies faintly on top of each other
+        (ghosting).
+    </p>
+    <p>
+        <strong>Two-band.</strong> Split each image into a low-frequency part (a Gaussian blur,
+        &sigma;&nbsp;=&nbsp;4) and a high-frequency part (the image minus the blur). Blend the
+        low frequencies with the feathered weights, which smooths out brightness and color
+        differences. For the high frequencies, don't average at all: at each pixel take the detail
+        from whichever image has the largest weight there. The result keeps the smooth color
+        transition of feathering, but edges and textures come from a single image, so they don't
+        ghost.
+    </p>
+<pre><code>for rgb, weight, alpha in layers:
+    # blur, then divide by the blurred mask so black outside the image doesn't bleed in
+    low = cv.GaussianBlur(rgb, (0, 0), sigma) / np.maximum(cv.GaussianBlur(alpha, (0, 0), sigma), 1e-8)[..., None]
+    detail = (rgb - low) * alpha[..., None]
+    low_total = low_total + low * weight[..., None]
+    weight_sum = weight_sum + weight
+    wins = weight > best_weight          # this image has the most weight here
+    high[wins] = detail[wins]
+    best_weight[wins] = weight[wins]
+mosaic = np.clip(low_total / np.maximum(weight_sum, 1e-8)[..., None] + high, 0, 1)</code></pre>
+    <p>
+        Dividing the blurred image by the blurred mask matters. Without it, blurring near the
+        image border would mix in the black pixels outside the image and leave a dark halo.
+        Two-band looked best on all three mosaics, so the results below use it.
+    </p>
+
+    <h3>Mosaic 1: Outside</h3>
+    <p>
+        With only two photos, warping one straight into the other's view stretches it a lot.
+        Instead I warp <em>both</em> halfway, into a view between the two. If <code>H</code> takes
+        left to right, then applying <code>&radic;H</code> twice does the same thing, so
+        <code>&radic;H</code> takes left to the halfway view. I compute the matrix square root from
+        the eigendecomposition, and the right image then gets
+        <code>&radic;H &middot; H<sup>-1</sup></code>. That way both images are distorted by the
+        same amount instead of one taking all of it.
+    </p>
+<pre><code>H = computeH(outside_left_pts, outside_right_pts)
+vals, vecs = np.linalg.eig(-H)   # -H is the same homography (scale doesn't matter)
+H_left  = (vecs @ np.diag(np.sqrt(vals)) @ np.linalg.inv(vecs)).real   # left  -> middle
+H_right = H_left @ np.linalg.inv(-H)                                   # right -> middle</code></pre>
+    <p>
+        I square-root <code>-H</code> instead of <code>H</code>. Least squares returned a matrix
+        whose overall sign is flipped, which doesn't change where any point goes, but the square
+        root of the negated version is the one that gives a sensible halfway view.
+    </p>
+    <figure class="wide">
+        <img src="./images/outside_warped.png" alt="Left and right outside photos each warped into the halfway view">
+        <figcaption>Both photos warped into the halfway view</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/outside_mosaic_full.png" alt="Uncropped outside mosaic, bow-tie shaped">
+        <figcaption>Uncropped mosaic</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/outside_blend_twoband.png" alt="Cropped outside panorama of the building and intersection, two-band blend">
+        <figcaption>Final mosaic (two-band blend)</figcaption>
+    </figure>
+    <div class="wide">
+        <figure>
+            <img src="./images/outside_blend_average.png" alt="Outside mosaic, average blend, with a seam in the middle">
+            <figcaption>Average: a hard vertical seam where the darker right photo begins</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/outside_blend_feathered.png" alt="Outside mosaic, feathered blend">
+            <figcaption>Feathered: the seam is gone, and the brightness change is spread out</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/outside_blend_twoband.png" alt="Outside mosaic, two-band blend">
+            <figcaption>Two-band</figcaption>
+        </figure>
+    </div>
+    <p>
+        The building lines up well where the photos overlap, and the curved facade reads as one
+        building. The right photo was shot into the sun, so it's darker than the left. With
+        averaging, that difference shows up as a hard vertical line in the middle. Feathering and
+        two-band both turn it into a gradual change. The phone's wide lens adds some barrel
+        distortion, which a homography can't model, so the edges of the frame still bend a little.
+    </p>
+
+    <h3>Mosaic 2: Inside</h3>
+    <p>
+        With three photos, the natural choice is to keep the middle one fixed and warp the left
+        and right photos into its view.
+    </p>
+    <figure class="wide">
+        <img src="./images/inside_warped.png" alt="Left warped into the middle view, middle unchanged, right warped into the middle view">
+        <figcaption>Left and right warped into the middle photo's view; the middle is unchanged</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/inside_mosaic_full.png" alt="Uncropped inside mosaic with a huge stretched left image">
+        <figcaption>Uncropped mosaic. The left photo is stretched to many times its size.</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/inside_blend_twoband.png" alt="Cropped inside panorama, two-band blend">
+        <figcaption>Final mosaic (two-band blend), cropped to the height of the middle photo</figcaption>
+    </figure>
+    <div class="wide">
+        <figure>
+            <img src="./images/inside_blend_average.png" alt="Inside mosaic, average blend, middle photo visible as a rectangle">
+            <figcaption>Average</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/inside_blend_feathered.png" alt="Inside mosaic, feathered blend">
+            <figcaption>Feathered</figcaption>
+        </figure>
+    </div>
+    <p>Zoomed in on the railing around the stair opening:</p>
+    <div class="wide">
+        <figure>
+            <img src="./images/inside_zoom_average.png" alt="Zoomed railing, average blend, with visible rectangle edges">
+            <figcaption>Average: the middle photo shows up as a brighter rectangle with hard edges</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/inside_zoom_feathered.png" alt="Zoomed railing, feathered blend, with doubled railing and person">
+            <figcaption>Feathered: no edges, but the railing and the walking person are doubled</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/inside_zoom_twoband.png" alt="Zoomed railing, two-band blend, sharp and single">
+            <figcaption>Two-band: no edges, and the railing and person are sharp and single</figcaption>
+        </figure>
+    </div>
+    <p>
+        The left photo was taken at a much larger rotation from the middle one, and since a flat
+        projection stretches more the farther you get from the center, it blows up and gets
+        blurry toward its outer edge. That's why I cropped to the middle photo's height and
+        limited the width. This mosaic shows the difference between the blends most clearly.
+        Averaging leaves the outline of the middle photo as a brighter rectangle, because its
+        exposure doesn't match its neighbors. Feathering fixes that but turns the railing into a
+        double image, and the person walking (who moved between shots) shows up twice.
+        Two-band keeps the smooth brightness and a single sharp railing.
+    </p>
+
+    <h3>Mosaic 3: Kitchen</h3>
+    <p>
+        Same setup as the inside mosaic: the middle photo stays fixed, and the left and right
+        photos are warped into its view. I shot this one from low down at counter height, close
+        to the objects on the counter.
+    </p>
+    <figure class="wide">
+        <img src="./images/kitchen_warped.png" alt="Kitchen left warped into the middle view, middle unchanged, right warped into the middle view">
+        <figcaption>Left and right warped into the middle photo's view; the middle is unchanged</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/kitchen_mosaic_full.png" alt="Uncropped kitchen mosaic with a huge stretched right image">
+        <figcaption>Uncropped mosaic. This time the right photo is the one that gets stretched.</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/kitchen_blend_twoband.png" alt="Cropped kitchen panorama, two-band blend">
+        <figcaption>Final mosaic (two-band blend), cropped to the height of the middle photo</figcaption>
+    </figure>
+    <div class="wide">
+        <figure>
+            <img src="./images/kitchen_blend_average.png" alt="Kitchen mosaic, average blend, with seams">
+            <figcaption>Average</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/kitchen_blend_feathered.png" alt="Kitchen mosaic, feathered blend">
+            <figcaption>Feathered</figcaption>
+        </figure>
+    </div>
+    <p>Zoomed in on the counter:</p>
+    <div class="photo-row wide">
+        <figure>
+            <img src="./images/kitchen_zoom_average.png" alt="Zoomed counter, average blend, with seam lines across the ceiling and blinds">
+            <figcaption>Average: seam lines across the ceiling and the blinds</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/kitchen_zoom_feathered.png" alt="Zoomed counter, feathered blend, with ghosted pots">
+            <figcaption>Feathered: no seams, but the pots are blurred and doubled</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/kitchen_zoom_twoband.png" alt="Zoomed counter, two-band blend, sharper pots">
+            <figcaption>Two-band: no seams, and the pots are much sharper</figcaption>
+        </figure>
+    </div>
+    <p>
+        The walls, doorway, cabinets and microwave line up, and the panorama shows much more of
+        the room than any single photo. The hard part is the counter in the middle. The pots and
+        the vase were only a foot or two from the phone, so even a small shift of the phone
+        between shots causes parallax: nearby objects move against the background more than a
+        pure rotation would explain. A single homography can't fit both near and far things at
+        once, so the two photos disagree about where the pots are. Feathering averages the two
+        positions, and you see a blurry double pot. Two-band hides most of this because each
+        pixel's detail comes from only one photo, but it can't truly fix a misalignment. The far
+        right edge is also heavily stretched because that photo was rotated a long way from the
+        middle one. A tripod, or more care to rotate around the lens, would help most.
+    </p>
+
+    <h2>What I Learned</h2>
+    <p>
+        The most useful thing was how much the point correspondences matter. With 10 good points
+        the fit was within a fraction of a pixel, but a homography is still only right for a
+        pure rotation and a lens with no distortion, so any parallax or barrel distortion shows up
+        as misalignment no matter how carefully you click. I also saw why planar mosaics get
+        stretched at the edges: the farther a photo is rotated from the reference, the more it
+        gets stretched, which is exactly what happened to the left inside photo.
+    </p>
+</body>
+</html>
