@@ -12,6 +12,8 @@
     <h1>Project 4: Image Warping and Mosaicing</h1>
     <p>
         <a href="#part-a"><em>Part A: Image Warping and Mosaicing</em></a>
+        &middot;
+        <a href="#part-b"><em>Part B: Feature Matching for Autostitching</em></a>
     </p>
 
     <figure class="wide">
@@ -19,7 +21,11 @@
         <figcaption>Three inside photos stitched into one panorama</figcaption>
     </figure>
 
-    <p>Code: <a href="https://www.kaggle.com/code/nikkoadrianpaclebucb/project-4-part-a">Kaggle notebook with all of my work</a></p>
+    <p>
+        Code: <a href="https://www.kaggle.com/code/nikkoadrianpaclebucb/project-4-part-a">Part A Kaggle notebook</a>
+        &middot;
+        <a href="https://www.kaggle.com/code/nikkoadrianpaclebucb/project-4-part-b">Part B Kaggle notebook</a>
+    </p>
 
     <h1 id="part-a">Part A: Image Warping and Mosaicing</h1>
 
@@ -618,6 +624,377 @@ H_right = H_left @ np.linalg.inv(-H)                                   # right -
         as misalignment no matter how carefully you click. I also saw why planar mosaics get
         stretched at the edges: the farther a photo is rotated from the reference, the more it
         gets stretched, which is exactly what happened to the left inside photo.
+    </p>
+
+    <!-- ===================================================================== -->
+    <!-- =============================== PART B ============================== -->
+    <!-- ===================================================================== -->
+    <h1 id="part-b">Part B: Feature Matching for Autostitching</h1>
+
+    <h2>Overview</h2>
+    <p>
+        In Part A, the slowest and most error-prone step was clicking the correspondences by hand.
+        In Part B the computer finds them. I follow a simplified version of
+        &ldquo;Multi-Image Matching using Multi-Scale Oriented Patches&rdquo; (Brown, Szeliski
+        and Winder), as described in the
+        <a href="https://cal-cs180.github.io/fa26/hw/proj3/partB.html">assignment</a>:
+    </p>
+    <ol>
+        <li>Find Harris corners in each image.</li>
+        <li>Keep 500 of them that are both strong and spread out (ANMS).</li>
+        <li>Describe each corner with a small, blurred, normalized patch.</li>
+        <li>Match patches between images, keeping only matches that are clearly better than the runner-up.</li>
+        <li>Use RANSAC to fit a homography that ignores the bad matches, then stitch as in Part A.</li>
+    </ol>
+    <p>
+        All images are downscaled to 20% before any processing. I walk through the steps on a new
+        pair of photos I took of a street at sunset (left and middle of a three-photo set), then
+        show the mosaics.
+    </p>
+    <div class="photo-row wide">
+        <figure>
+            <img src="./images/b_street_left_input.jpg" alt="Left street photo at sunset: building under scaffolding, power pole and crosswalk">
+            <figcaption>Street left</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/b_street_mid_input.jpg" alt="Middle street photo: intersection, houses and trees">
+            <figcaption>Street middle</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/b_street_right_input.jpg" alt="Right street photo: crosswalk, palm tree and cars">
+            <figcaption>Street right</figcaption>
+        </figure>
+    </div>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ B.1 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>B.1 Harris Corner Detection</h2>
+    <p>
+        I used the provided <code>get_harris_corners</code>, which computes the Harris response
+        <code>h</code> on the grayscale image (<code>corner_harris</code>, &sigma;&nbsp;=&nbsp;1),
+        takes every local maximum as a corner, and drops anything within 20 pixels of the border
+        (so a full 40&times;40 descriptor window always fits later). On the 857&times;1142 left
+        image this gives <strong>24,831 corners</strong>, far too many and mostly clumped together.
+    </p>
+    <figure class="wide">
+        <img src="./images/b_harris.jpg" alt="Harris response heat map next to the left street photo covered in yellow corner dots">
+        <figcaption>
+            Left: the Harris response <code>h</code>. Right: every detected corner. They pile up
+            on the high-texture areas: the scaffolding, wires, tree and cobblestones.
+        </figcaption>
+    </figure>
+
+    <h3>Adaptive Non-Maximal Suppression (ANMS)</h3>
+    <p>
+        If I just kept the 500 strongest corners, they would all bunch up on the busiest parts of
+        the image and miss everything else. Matching needs corners spread across the image,
+        especially in the region that overlaps the other photo. ANMS gives each corner a
+        <em>suppression radius</em>: the distance to the nearest corner that is clearly stronger
+        than it. Then it keeps the 500 corners with the biggest radii.
+    </p>
+    <pre><code>r<sub>i</sub> = min<sub>j</sub> ||x<sub>i</sub> &minus; x<sub>j</sub>||   over all j with  f(x<sub>i</sub>) &lt; c<sub>robust</sub> &middot; f(x<sub>j</sub>),   c<sub>robust</sub> = 0.9</code></pre>
+    <p>
+        The strongest corner has nothing stronger than it, so its radius is &infin; and it is
+        always kept. A weak corner right next to a strong one gets a tiny radius and is dropped.
+        A weak corner alone in a smooth area gets a big radius and survives. To keep it fast, I
+        first sort by strength and keep the top 5000. Then, for corner <code>i</code>, only the
+        corners before it in that list can be stronger, so each loop step checks only those.
+    </p>
+<pre><code>def get_anms(image):
+    h, coords = get_harris_corners(image)
+
+    strength = h[coords[0], coords[1]]
+    top = np.argsort(strength)[::-1][:5000]          # strongest first
+    coords_top = coords[:, top]
+    strength = strength[top]
+
+    corner_count = min(len(coords[0]), 5000)
+    radii = np.full(corner_count, np.inf)
+    c_robust = 0.9
+    for i in range(corner_count):
+        # every earlier corner is at least as strong; keep those that are *clearly* stronger
+        stronger_prev_i = strength[i] &lt; c_robust * strength[:i]
+        if stronger_prev_i.any():
+            dy = coords_top[0, :i][stronger_prev_i] - coords_top[0][i]
+            dx = coords_top[1, :i][stronger_prev_i] - coords_top[1][i]
+            radii[i] = np.min(dy**2 + dx**2)
+
+    sorted_radii_index = np.argsort(radii)[::-1][:500]  # largest radius first
+    return coords_top[:, sorted_radii_index]</code></pre>
+    <p>
+        (I compare squared radii. Squaring doesn't change the order, so I can skip the square root.)
+    </p>
+    <figure class="wide">
+        <img src="./images/b_anms.jpg" alt="Left street photo twice: strongest 500 corners clumped on poles and the car, versus ANMS 500 corners spread evenly">
+        <figcaption>
+            Left: the 500 strongest corners crowd onto the power poles, the car and the treetops,
+            with almost none on the road. Right: ANMS picks 500 corners spread over the whole
+            image, including the crosswalk, the building and the sidewalk.
+        </figcaption>
+    </figure>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ B.2 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>B.2 Feature Descriptor Extraction</h2>
+    <p>
+        For each ANMS corner I cut out a 40&times;40 window of the grayscale image centered on it
+        and shrink it to 8&times;8 with anti-aliasing. That works like sampling every 5 pixels
+        after a blur, so the descriptor ignores fine detail and small position errors.
+        Then I apply bias/gain normalization: subtract the mean and divide by the standard
+        deviation. That way, the same corner in a brighter or darker photo gives the same
+        descriptor. Following the assignment, the patches are axis-aligned (no rotation) and I
+        skip the wavelet step.
+    </p>
+<pre><code>for i in range(img_anms.shape[1]):
+    y, x = img_anms[0][i], img_anms[1][i]
+    window = img_gray[y - 20 : y + 20, x - 20 : x + 20]               # 40x40
+    window_smaller = resize(window, (8, 8), anti_aliasing=True)       # blurred 8x8
+    window_smaller_normalized = (window_smaller - window_smaller.mean()) / (window_smaller.std() + 1e-8)</code></pre>
+    <div class="photo-row">
+        <figure>
+            <img src="./images/b_descriptor_locations.jpg" alt="Left street photo with six numbered yellow 40 by 40 boxes">
+            <figcaption>Six corners spaced evenly through the ANMS list</figcaption>
+        </figure>
+    </div>
+    <figure class="wide">
+        <img src="./images/b_descriptors.png" alt="Six 40 by 40 grayscale windows above their 8 by 8 normalized descriptors">
+        <figcaption>
+            Top: the raw 40&times;40 windows (a house window, the car's wheel, the curb, the
+            &ldquo;Le Conte Ave&rdquo; sign, the scaffolding, the bike-lane edge). Bottom: the
+            8&times;8 normalized descriptors. Fine texture is gone, but the main structure is
+            still there, like the bright curb stripe in #3 or the vertical pole in #5.
+        </figcaption>
+    </figure>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ B.3 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>B.3 Feature Matching</h2>
+    <p>
+        Each descriptor is 64 numbers, so I compare every descriptor in one image with every
+        descriptor in the other using the sum of squared differences (a 500&times;500 table). The
+        closest descriptor alone isn't a good test, because some patches (sky, plain wall) are
+        close to many things. Instead I use Lowe's ratio test. For each feature, divide the error
+        of its best match (1-NN) by the error of its second-best match (2-NN). A real match should
+        be much better than any other candidate, so its ratio is small. A feature with no
+        real match has two similar, equally bad candidates, so its ratio is close to 1.
+    </p>
+<pre><code>for i in range(warp_count):
+    closest_order = np.argsort(distance[i])
+    nn1 = distance[i][closest_order[0]]
+    nn2 = distance[i][closest_order[1]]
+    ratio[i] = nn1 / nn2
+    best[i] = closest_order[0]
+
+keep = ratio &lt; 0.3</code></pre>
+    <p>
+        <strong>Choosing the threshold.</strong> Figure 6b in the paper shows that correct
+        matches mostly have a 1-NN/2-NN ratio below about 0.3&ndash;0.4, while wrong matches are
+        spread out up toward 1. I picked <strong>0.3</strong>, on the low end. I'd rather throw away
+        some good matches than let in bad ones, because RANSAC only needs a handful of good matches.
+        To check, I labeled every one of the 500 left features as correct or incorrect: correct
+        means its best match agrees with the final homography to within 3 pixels. That gives the
+        same kind of plot as Figure 6b for my own images:
+    </p>
+    <figure>
+        <img src="./images/b_ratio_hist.png" alt="Histogram of ratios: green correct matches concentrated below 0.3, red incorrect matches piled up near 1">
+        <figcaption>
+            1-NN/2-NN ratio for all 500 left-image features. Most correct matches (green) fall below
+            0.3, and the incorrect ones (red) pile up near 1, just like Figure 6b. Of the 133
+            features below the threshold, 115 are correct. Many of the &ldquo;incorrect&rdquo; ones are
+            simply corners outside the overlap, which have no true match at all.
+        </figcaption>
+    </figure>
+    <p>
+        With the 0.3 threshold, the street pair gives <strong>133 matches</strong>. Here are the six
+        with the lowest ratio, and all of the matches drawn between the two images:
+    </p>
+    <figure class="wide">
+        <img src="./images/b_match_patches.png" alt="Six pairs of 8 by 8 descriptors, left image on top and middle image below, nearly identical">
+        <figcaption>The six best matches. Each top descriptor (left image) nearly matches the one below it (middle image).</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/b_matches.jpg" alt="Left and middle street photos with 133 colored lines joining matched features">
+        <figcaption>
+            All 133 matches. Most lines are parallel and horizontal, which is what a camera
+            turning right should produce. A few lines cut across at an angle; those are wrong matches.
+        </figcaption>
+    </figure>
+
+    <!-- ===================================================================== -->
+    <!-- ================================ B.4 ================================ -->
+    <!-- ===================================================================== -->
+    <h2>B.4 RANSAC for Robust Homography</h2>
+    <p>
+        Even after the ratio test, a few matches are wrong, and least squares is badly thrown off
+        by even one wrong match far from where it should be. 4-point RANSAC handles this:
+    </p>
+    <ol>
+        <li>Pick 4 random matches and compute the exact homography through them (<code>compute_H</code> from Part A).</li>
+        <li>Map every left point through that homography and count how many land within &epsilon;&nbsp;=&nbsp;3 pixels of their match. These are the <em>inliers</em>.</li>
+        <li>Repeat 1000 times and keep the largest set of inliers.</li>
+        <li>Refit the homography with least squares on all of those inliers.</li>
+    </ol>
+<pre><code>def ransac_H(warp_points, ref_points, iterations=1000, epsilon=3):
+    rng = np.random.default_rng(0)
+    matches_count = len(warp_points)
+    best_inliers = np.zeros(matches_count, dtype=bool)
+    ones = np.ones((matches_count, 1))
+
+    for _ in range(iterations):
+        four = rng.choice(matches_count, size=4, replace=False)
+        H = compute_H(warp_points[four], ref_points[four])
+
+        mapped = (H @ np.hstack([warp_points, ones]).T).T
+        mapped_ratio = mapped[:, :2] / mapped[:, 2:3]
+        distance = np.sqrt(np.sum((mapped_ratio - ref_points) ** 2, axis=1))
+        inliers = distance &lt; epsilon
+
+        if inliers.sum() &gt; best_inliers.sum():
+            best_inliers = inliers
+
+    H = compute_H(warp_points[best_inliers], ref_points[best_inliers])
+    return H, best_inliers</code></pre>
+    <figure class="wide">
+        <img src="./images/b_ransac.jpg" alt="Street matches colored green for inliers and red for outliers">
+        <figcaption>
+            RANSAC keeps 111 of the 133 matches (green). The 22 it rejects (red) are the slanted
+            lines: matches on the power-line wires and the repeating cobblestones, where
+            several spots look alike.
+        </figcaption>
+    </figure>
+    <p>
+        For stitching I reuse the Part A approach, simplified for two images. I keep the
+        reference image fixed, warp the other image onto a canvas big enough for both, and pick
+        which image each pixel comes from (whichever one the pixel is deeper inside, measured with
+        <code>distance_transform_edt</code>). I blend that choice with a 5-level Laplacian stack
+        so the seam doesn't show, and then shrink the crop one edge at a time until no black
+        pixels are left.
+    </p>
+
+    <h3>Automatic mosaic 1: Street (left + middle)</h3>
+    <figure class="wide">
+        <img src="./images/b_street_lm.jpg" alt="Automatically stitched street mosaic: scaffolded building, power pole, intersection and houses under a pink sky">
+        <figcaption>Left warped onto the middle photo. 133 matches, 111 inliers.</figcaption>
+    </figure>
+    <p>
+        The crosswalk stripes, bike lane and power lines all continue straight through the
+        seam. The bright pink sky blends smoothly, even though the two photos were exposed a little
+        differently.
+    </p>
+
+    <h3>Automatic mosaic 2: Street (middle + right)</h3>
+    <figure class="wide">
+        <img src="./images/b_street_mr_ransac.jpg" alt="Middle and right street photos with RANSAC inliers in green and outliers in red">
+        <figcaption>198 matches, 175 RANSAC inliers</figcaption>
+    </figure>
+    <figure class="wide">
+        <img src="./images/b_street_mr.jpg" alt="Automatically stitched street mosaic of the intersection, palm tree and cars">
+        <figcaption>Middle warped onto the right photo</figcaption>
+    </figure>
+    <p>
+        This pair gave the most matches of any pair, since the two photos overlap a lot and the
+        street has plenty of sharp corners (crosswalk stripes, signs, car edges). The cars and the
+        person crossing moved between shots, but there are only a few of them, so RANSAC just
+        treats their matches as outliers.
+    </p>
+
+    <h3>Automatic mosaic 3 and manual vs. automatic: Kitchen (left + middle)</h3>
+    <p>
+        For the next two pairs I clicked correspondences by hand in Part A, so I can compare
+        directly. To make the comparison fair, both versions below use exactly the same warp,
+        blend and crop code. The only difference is where the homography comes from: my 10 clicked
+        points from Part A (scaled to this resolution), or the RANSAC fit on automatic matches.
+    </p>
+    <figure class="wide">
+        <img src="./images/b_kitchen_ransac.jpg" alt="Kitchen left and middle photos with RANSAC inliers in green and outliers in red">
+        <figcaption>44 matches, 22 RANSAC inliers</figcaption>
+    </figure>
+    <div class="photo-row wide">
+        <figure>
+            <img src="./images/b_kitchen_manual.jpg" alt="Kitchen mosaic stitched from hand-clicked points">
+            <figcaption>Manual (10 clicked points)</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/b_kitchen_auto.jpg" alt="Kitchen mosaic stitched automatically">
+            <figcaption>Automatic (22 RANSAC inliers)</figcaption>
+        </figure>
+    </div>
+    <p>
+        The two are very close. The doorway, light switch, cabinets, flowers and pots all line up
+        in both. The automatic homography fits its own inliers to within 1.4 pixels on average. It
+        isn't identical to the manual one, though: if I map my clicked Part A points through it,
+        they land about 23 pixels from where I clicked their partners. The two sets of points
+        come from different parts of the scene, and a homography fit to one area can drift
+        elsewhere, especially toward the heavily stretched left side, where the plain wall has
+        almost nothing to match. You can see the difference in the far left, where the manual
+        mosaic keeps more of the poster in the crop. Only half the kitchen matches
+        survived RANSAC. The plain walls give few distinctive corners, and the objects on the
+        counter are close to the camera, so they have some parallax, the same problem as in Part A.
+    </p>
+
+    <h3>A failure case: Inside (middle + right)</h3>
+    <figure class="wide">
+        <img src="./images/b_inside_ransac.jpg" alt="Inside middle and right photos with only a handful of matches, several crossing at angles">
+        <figcaption>Only 11 matches pass the ratio test, and RANSAC's best set is just 6</figcaption>
+    </figure>
+    <div class="photo-row wide">
+        <figure>
+            <img src="./images/b_inside_manual.jpg" alt="Inside mosaic stitched from hand-clicked points, railing continuous">
+            <figcaption>Manual: stitches correctly</figcaption>
+        </figure>
+        <figure>
+            <img src="./images/b_inside_auto.jpg" alt="Inside automatic result showing only the right photo">
+            <figcaption>Automatic: the homography is wrong, so only the reference photo is left after cropping</figcaption>
+        </figure>
+    </div>
+    <p>
+        The inside atrium is where automatic matching broke down, and the reason is interesting.
+        Almost every corner in these photos sits on a railing with dozens of identical vertical
+        bars, or on the identical wood panels and light fixtures. A patch on one bar looks just
+        like a patch on the bar next to it, so the best and second-best matches have about the
+        same error, and the ratio test throws them away (correctly). That leaves only 11
+        matches, several of them wrong. With so few matches, RANSAC can find 6 that happen to agree
+        with each other, and they lie almost on a line along the railing, so the least-squares
+        refit through them is badly conditioned and gives a homography that throws the middle photo
+        off the canvas. Raising the ratio threshold doesn't fix it reliably. 0.4 happened to work,
+        but 0.5 and 0.6 failed again, because every extra match let in was mostly another
+        repeated-railing mismatch. My hand-picked points avoided this because I could tell which
+        railing post was which from the surrounding context, which an 8&times;8 patch can't capture.
+        This is the kind of scene where rotation-invariant or multi-scale descriptors, or simply
+        more overlap between shots, would help.
+    </p>
+
+    <h3>Summary</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Pair</th>
+                <th class="num">Matches (ratio &lt; 0.3)</th>
+                <th class="num">RANSAC inliers</th>
+                <th>Result</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>Street left + middle</td><td class="num">133</td><td class="num">111</td><td>Good</td></tr>
+            <tr><td>Street middle + right</td><td class="num">198</td><td class="num">175</td><td>Good</td></tr>
+            <tr><td>Kitchen left + middle</td><td class="num">44</td><td class="num">22</td><td>Good, close to manual</td></tr>
+            <tr><td>Inside middle + right</td><td class="num">11</td><td class="num">6</td><td>Failed (repetitive railing)</td></tr>
+        </tbody>
+    </table>
+
+    <h2>What I Learned (Part B)</h2>
+    <p>
+        The coolest part was how well a very simple pipeline works: 8&times;8 blurry patches, a
+        ratio test and random sampling are enough to replace careful hand-clicking on most scenes.
+        The ratio test was the most important piece. Thresholding the match error alone doesn't
+        work, because some patches are close to everything, but comparing the best match to the
+        second best tells you whether a match is <em>unambiguous</em>. That same idea explains the
+        failure on the inside set: when a scene repeats itself, nothing is unambiguous. RANSAC
+        was also impressive. With 111 good matches and 22 bad ones, it found the right homography,
+        where one least-squares fit over all of them would have been pulled off by the bad ones.
     </p>
 </body>
 </html>
